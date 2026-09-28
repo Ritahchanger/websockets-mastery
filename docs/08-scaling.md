@@ -6,6 +6,8 @@
 
 > Prerequisites: the `noServer` + `upgrade` pattern from [Chapter 3](03-express-integration.md), the `{type,id,payload,replyTo}` envelope and rooms from [Chapter 4](04-messaging-patterns.md), heartbeats / backoff / graceful shutdown from [Chapter 5](05-reliability.md), and Socket.IO basics from [Chapter 7](07-socketio.md).
 
+> **In plain English:** Think of a restaurant that grows from one dining room to three. A waiter can only serve the tables in their own room, so when someone makes a toast in room 1, the diners in rooms 2 and 3 never hear it unless someone relays it over an intercom. With several servers, each one can only write to the sockets it holds, and Redis [pub/sub](glossary.md#pub-sub) is the intercom (the *backplane*): every server publishes room messages to it, and every server with members in that room delivers them locally. The rest of the chapter is plumbing around that idea: load balancers and [sticky sessions](glossary.md#sticky-session), nginx, using every CPU core, operating-system limits, and measuring how much you can actually handle.
+
 ---
 
 ## 1. Why one process is not enough
@@ -920,6 +922,8 @@ Note the Dockerfile runs `node` directly: with `npm run` as PID 1, `SIGTERM` oft
 
 ### Cloud load balancer notes
 
+> 🔬 **Deep dive — optional on first read.** A reference list of vendor-specific timeouts. Skim it now and come back when you deploy to a particular cloud. The rule that carries over everywhere: every hop has an idle or lifetime timeout, and your heartbeat must beat the shortest one.
+
 - **AWS ALB** supports WebSockets natively; idle timeout default **60 s** (configurable up to 4000 s). NLB (L4) passes TCP through; its idle timeout is 350 s and not always visible to you — heartbeat anyway.
 - **GCP HTTP(S) LB**: the *backend service timeout* (default 30 s) is the **maximum lifetime** of a WebSocket, not an idle timeout — set it to hours or your sockets die every 30 s.
 - **Cloudflare**: WebSockets are proxied; idle connections are closed after ~100 s without traffic. Connections are also dropped when Cloudflare restarts edge servers — your reconnect logic will be exercised.
@@ -993,6 +997,8 @@ Cluster vs. several containers: cluster is convenient on a VM; in Kubernetes pre
 ---
 
 ## 8. Kernel and OS tuning for many connections
+
+> 🔬 **Deep dive — optional on first read.** This section is Linux operations work (file descriptors, ephemeral ports, `sysctl`s) that only matters from tens of thousands of connections per machine. On a first pass, remember two symptoms: `EMFILE` means you've hit the file-descriptor limit (`ulimit -n`), and a load generator stuck near ~28k connections has run out of ephemeral ports. It's not a server bug.
 
 Out of the box Linux is tuned for a desktop, not for 200,000 sockets.
 
@@ -1243,6 +1249,8 @@ redis-cli --latency
 
 ## 10. Scaling Redis itself
 
+> 🔬 **Deep dive — optional on first read.** You only need this once a single Redis instance becomes the bottleneck, which is well beyond most apps. Skip it on a first read.
+
 Redis pub/sub is fast (hundreds of thousands of messages/s on one core), but it is one thread, and **every published message is sent to every subscribed node**. Strategies as you grow:
 
 - **Per-room channels** (as we did) so nodes only receive rooms they host. Combine with a smart LB (route users of the same room/tenant to the same subset of nodes) to cut cross-node traffic.
@@ -1283,6 +1291,63 @@ Redis pub/sub is fast (hundreds of thousands of messages/s on one core), but it 
 - Ex 3: `const n = await pub.hincrby(key, user, -1); if (n <= 0) { await pub.hdel(key, user); publish left }`. Crashed nodes again — decrement their counts when you detect a dead node, or store per-node counts.
 - Ex 4: A module-level `let draining = false`; in the upgrade handler reject with `503` when draining; `setInterval` that closes `[...wss.clients].slice(0, 500)`.
 - Ex 5: `pidstat -p <pid> 1` or `top -p`; `redis-cli INFO cpu`. Usually the node's JSON/send loop saturates first; with many nodes, Redis's single core eventually does.
+
+</details>
+
+---
+
+## Check your understanding
+
+1. Alice and Bob are in room `lobby`, but the load balancer put Alice on Node 1 and Bob on Node 2. Each node keeps rooms in an in-memory `Map<string, Set<WebSocket>>`. Alice sends "hi". What does Bob see, and why can't Node 1 just send it to him directly?
+
+<details><summary>Answer</summary>
+
+Bob sees **nothing**. Node 1's `lobby` Set only contains Alice. A WebSocket is a TCP connection that ends on one specific machine, so only Node 2 can physically write to Bob's socket. You need a **backplane** (Redis pub/sub here): Node 1 publishes to `chat:room:lobby`, and every node subscribed to that channel delivers to its own local members. See §2.
+
+</details>
+
+2. Spot the bug:
+
+   ```js
+   const redis = new Redis(REDIS_URL);
+   await redis.subscribe('chat:room:lobby');
+   redis.on('message', deliverToLocalMembers);
+
+   // later, inside a WebSocket message handler:
+   await redis.publish('chat:room:lobby', data);
+   ```
+
+<details><summary>Answer</summary>
+
+After `SUBSCRIBE`, a Redis connection is in **subscriber mode** and can only run (P)SUBSCRIBE/UNSUBSCRIBE/PING/QUIT/RESET, so the `publish` fails with `ERR Connection in subscriber mode…`. Use two connections: `const sub = pub.duplicate()` for subscriptions, and `pub` for `PUBLISH` and normal commands. See §2 (design decision 4), §3.1 and pitfall 1.
+
+</details>
+
+3. Behind a plain round-robin load balancer with no stickiness, which of these work reliably? (a) raw `ws`; (b) Socket.IO with default transports; (c) Socket.IO with `transports: ['websocket']`.
+
+<details><summary>Answer</summary>
+
+**(a)** and **(c)** work. A WebSocket is one long-lived TCP connection, so after the upgrade every frame goes to the same node anyway, and on reconnect the client can land anywhere as long as shared state is in Redis and it re-joins its rooms. **(b)** fails. Long-polling is a *series* of separate HTTP requests tied to a `sid` that exists only on the node that created it, so a request hitting another node gets `400 Session ID unknown`. Fix it with sticky sessions (`ip_hash`, cookie stickiness) or by disabling polling. See §5.
+
+</details>
+
+4. Your nginx config for `/ws` is just `location /ws { proxy_pass http://app; }`. What does the browser see? After you fix that, connections still die after **exactly** 60 s of quiet. Why?
+
+<details><summary>Answer</summary>
+
+`Upgrade` and `Connection` are hop-by-hop headers that nginx doesn't forward by default, and it talks HTTP/1.0 to upstreams. Your app receives a plain GET and answers 404/400/426, and the browser reports **1006**. Add `proxy_http_version 1.1;`, `proxy_set_header Upgrade $http_upgrade;` and `proxy_set_header Connection "upgrade";`. The 60 s deaths come from nginx's default `proxy_read_timeout 60s`. Raise it, and keep your heartbeat interval well below it. See §6 and pitfall 4.
+
+</details>
+
+5. This loop broadcasts to a 10,000-member room. What's wasteful about it? And if 2,000 clients are spread over 20 rooms and send 1,000 messages/s in total, how many deliveries per second must your cluster make?
+
+   ```js
+   for (const ws of room) ws.send(JSON.stringify(msg));
+   ```
+
+<details><summary>Answer</summary>
+
+It runs `JSON.stringify` **once per recipient**, which is 10,000 times the JSON work for the same bytes. Serialize once outside the loop and send the same string to everyone. Fan-out, not connection count, is usually the CPU killer. For the numbers: 2,000 / 20 = 100 members per room, so 1,000 msgs/s × 100 = **100,000 deliveries/s**. Plan capacity on *messages × room size*. See §1, "What does one connection cost?", and §9.
 
 </details>
 

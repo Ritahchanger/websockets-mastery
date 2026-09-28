@@ -4,6 +4,105 @@
 
 **What you'll learn.** Chapter 10 ended at the mesh wall: every participant uploads its video N − 1 times. In this chapter you replace the mesh with a **Selective Forwarding Unit** built on **mediasoup v3**. You will learn the three multiparty topologies (Mesh, MCU, SFU) and their costs. You will learn mediasoup's object model (**Worker → Router → Transport → Producer/Consumer**, plus DataProducer/DataConsumer), how the browser side (`mediasoup-client`'s **Device**) maps its `connect` / `produce` events to WebSocket request/response messages, and the complete signaling flow, step by step. Then you will go past the basics: **simulcast & SVC** with `setPreferredLayers`, **active speaker detection**, **stats**, **`pipeToRouter`** for rooms bigger than one CPU core, and **recording** with a `PlainTransport` feeding FFmpeg/GStreamer. The full server and client of `examples/11-mediasoup-minimal/` are printed and explained here, so you can learn everything from this page.
 
+> **In plain English:** In chapter 10 every browser sent its video to every other browser, and that broke down at about 4 people. Now every browser sends its video **once**, to your server. The server makes copies and hands one copy to each person who wants to watch. It never opens or re-encodes the video, it just forwards packets. That kind of server is called an [SFU](glossary.md#sfu), and **mediasoup** is a Node library that gives you one. mediasoup does the heavy media work in C++. Everything else, including rooms, users and the conversation with the browser, is your WebSocket code, exactly like chapters 3–9.
+
+---
+
+## Bridge: from peer-to-peer to an SFU, in plain English
+
+Read this section before any mediasoup code. It has no new APIs, only the mental model the rest of the chapter hangs on.
+
+### Where chapter 10 left you
+
+In chapter 10 you built a video call where:
+
+- An Express + `ws` server relayed **signaling** messages (SDP descriptions and ICE candidates) between browsers in a room.
+- Each browser held **one `RTCPeerConnection` per other participant** and used perfect negotiation to create and answer offers.
+- Media flowed **directly between browsers**. Your server never saw a video packet.
+
+That design hits a wall: **mesh bandwidth**. With N people, each browser encodes and uploads its video N − 1 times. At 4 peers that is about 4.6 Mbit/s of uplink and 3 simultaneous encoders per laptop, and quality collapses for everyone. You cannot fix that on the client. The fix is to upload **once** to something that makes the copies.
+
+### The analogy: a post office for video
+
+Think of the SFU as a **post office**. Each participant mails *one* copy of their video to the post office. The post office photocopies it for every subscriber and delivers it. It never opens the envelopes, which is like an SFU that never decodes the video. It can pick the smallest envelope that fits through each subscriber's letterbox, which is what simulcast does.
+
+| Real-world thing | mediasoup object | What it does | Ch.10 equivalent |
+|---|---|---|---|
+| The **post office building** and its staff (one per CPU core) | **Worker** | A C++ subprocess that does all the packet handling on one CPU core. You start one per core. | None. No server was in the media path. |
+| A **sorting desk for one neighbourhood** | **Router** | One "room" inside a worker: which codecs are allowed, and the table of who receives what. | The `room` in your signaling server, but now it handles media too. |
+| A **collection van** (house → post office) | **Transport, send side** (`WebRtcTransport`) | One encrypted ICE + DTLS connection from one browser *to* the server, carrying everything that browser publishes. | Half of an `RTCPeerConnection`. **Send + recv transport pair ≈ one `RTCPeerConnection`**, but now there is one pair per person, to the server, no matter how big the room is. |
+| A **delivery van** (post office → house) | **Transport, recv side** (`WebRtcTransport`) | One connection from the server *to* one browser, carrying everything that browser watches. | The other half of that `RTCPeerConnection`. |
+| A **publication** someone mails in (Alice's camera magazine) | **Producer** | One incoming track (audio *or* video) arriving on a send transport. | `pc.addTrack(track)` / an `RTCRtpSender` on the sender. |
+| **One subscriber's copy** of that publication | **Consumer** | One outgoing copy of a Producer, sent to one recv transport. | The `track` event / an `RTCRtpReceiver` on the receiver. |
+| **Postcards** instead of magazines | **DataProducer / DataConsumer** | The same publish/subscribe idea for data-channel messages (SCTP) instead of audio and video. | `pc.createDataChannel()` / the `datachannel` event. |
+| The **household's mail kit**, which knows what fits its letterbox and fills in the forms | **Device** (`mediasoup-client`, in the browser) | Learns the router's codecs, creates the browser-side transports, and writes and applies all the SDP for you. | The SDP work you did yourself: `setLocalDescription`, `setRemoteDescription`, perfect negotiation. |
+| The **phone line to the front desk**, where you arrange deliveries | *(not mediasoup)* your **WebSocket** | Carries the requests: "open me a van", "I'm publishing a camera", "send me Bob's camera". | The same signaling WebSocket as chapter 10. |
+
+### What exists on the server when 3 people are in a room
+
+Alice, Bob and Carol each publish a camera. (Add microphones and every Producer and Consumer below doubles.)
+
+```mermaid
+flowchart LR
+  A1["Alice's browser<br/>(sending)"] ==>|upload 1×| AS
+  B1["Bob's browser<br/>(sending)"] ==>|upload 1×| BS
+  C1["Carol's browser<br/>(sending)"] ==>|upload 1×| CS
+  subgraph W["Worker (one CPU core)"]
+    subgraph R["Router: room 'demo'"]
+      AS[Alice send transport] --> AP((Producer<br/>Alice cam))
+      BS[Bob send transport] --> BP((Producer<br/>Bob cam))
+      CS[Carol send transport] --> CP((Producer<br/>Carol cam))
+      AP --> AtoB[Consumer<br/>Alice cam → Bob]
+      AP --> AtoC[Consumer<br/>Alice cam → Carol]
+      BP --> BtoA[Consumer<br/>Bob cam → Alice]
+      BP --> BtoC[Consumer<br/>Bob cam → Carol]
+      CP --> CtoA[Consumer<br/>Carol cam → Alice]
+      CP --> CtoB[Consumer<br/>Carol cam → Bob]
+      BtoA --> AR[Alice recv transport]
+      CtoA --> AR
+      AtoB --> BR[Bob recv transport]
+      CtoB --> BR
+      AtoC --> CR[Carol recv transport]
+      BtoC --> CR
+    end
+  end
+  AR ==> A2["Alice's browser<br/>(watching)"]
+  BR ==> B2["Bob's browser<br/>(watching)"]
+  CR ==> C2["Carol's browser<br/>(watching)"]
+```
+
+Count them: **1** worker, **1** router, **6** transports (2 per person), **3** producers (1 per published track) and **6** consumers (each producer × each *other* person). Each browser uploads once, whatever the room size.
+
+### The whole flow in 7 plain-English steps
+
+Section 4 has the detailed sequence diagram. Here is the same story without the API names:
+
+1. **"What do you speak?"** The browser asks the server which codecs the room uses, then loads its **Device** with that answer.
+2. **"Open me two vans."** The browser asks the server for a **send transport** and a **recv transport**. The server creates them and replies with their connection details. The Device builds the matching browser-side transports.
+3. **"I'm here."** The browser joins the room and says what it can *receive*. The server replies with who is already there and what they are publishing.
+4. **"I'm publishing my camera."** The browser calls `produce()` with its camera track. mediasoup-client fires a `connect` event the first time (to finish the encrypted handshake) and a `produce` event. You forward each one as a WebSocket request, the server creates a **Producer**, and you hand its id back to the library.
+5. **"Hey everyone, new video!"** The server notifies every other peer that a new producer exists.
+6. **"Send me that one."** Each other peer asks to consume it. The server creates a **Consumer** (paused), returns its parameters, and the browser turns them into a `MediaStreamTrack` for a `<video>` element.
+7. **"Ready, go."** The browser says it has set up its end. The server resumes the consumer and asks the sender for a fresh keyframe, and the video appears. When someone leaves, closing their transports cascades to their producers and consumers, and the server tells everyone else.
+
+### Same vs different, compared with chapter 10
+
+**The same:**
+
+- Signaling still goes over **your WebSocket**, as JSON request/response and notifications (the ch.4 envelope).
+- Media is still **WebRTC**: ICE, DTLS-SRTP, UDP with TCP fallback, and TURN for locked-down clients.
+- `getUserMedia`, `MediaStreamTrack`, `<video playsinline muted>`, secure contexts and `chrome://webrtc-internals` all work as before.
+
+**Different:**
+
+- **You no longer handle offers and answers.** mediasoup-client generates and applies the SDP inside the browser. What you ship over the WebSocket are *parameters* objects (`rtpCapabilities`, `dtlsParameters`, `rtpParameters`).
+- **No perfect negotiation.** The server is always one side of every connection, so there is no glare to resolve.
+- **The server is now in the media path.** Every packet goes browser → server → browser. Your server needs a public IP, open UDP ports and CPU for forwarding, and it can see (and record) the media.
+- **Connections are per person, not per pair.** Each browser holds 2 transports to the server instead of N − 1 PeerConnections.
+- **Publish/subscribe replaces "call someone".** You *produce* a track once, and anyone can *consume* it. The server decides who gets what, and at which quality layer.
+
+With this map in your head, the rest of the chapter fills in each box with real code.
+
 ---
 
 ## 1. Topologies: Mesh vs MCU vs SFU
@@ -956,6 +1055,8 @@ Open three tabs and watch `/stats`: with N peers you get **N × 2 producers** an
 
 ## 6. Simulcast and SVC
 
+> 🔬 **Deep dive — optional on first read.** The minimal example already sends simulcast and lets you pick a receive quality. This section explains the layer internals. Come back to it when you tune quality for real rooms.
+
 **Simulcast**: the sender encodes the *same* track several times at different resolutions and bitrates (e.g. 180p/360p/720p, one SSRC or RID each). The SFU forwards exactly one of those streams to each consumer and can switch between them on a keyframe.
 
 **SVC (Scalable Video Coding)**: *one* stream with nested layers. VP9 and AV1 support spatial + temporal SVC. `L3T3_KEY` means 3 spatial × 3 temporal layers, with inter-layer prediction only on keyframes. The SFU drops layers by filtering packets.
@@ -1031,6 +1132,8 @@ The two numbers most worth watching in production are **producer/consumer `score
 
 ## 9. Scaling one room past one core: `pipeToRouter`
 
+> 🔬 **Deep dive — optional on first read.** You only need this once a single room outgrows one CPU core, which means hundreds of consumers. Rooms of up to a few dozen people fit on one router.
+
 A worker is one thread. A rough figure is **~500 consumers per worker**, fewer with high-bitrate video. A 100-person room where everyone has video is 100 × 99 ≈ 10 000 video consumers, which no single core can handle. Rooms like that also tend to be "few speakers, many viewers", which works nicely with piping:
 
 ```mermaid
@@ -1066,6 +1169,8 @@ Things to know:
 ---
 
 ## 10. Recording: PlainTransport → FFmpeg / GStreamer
+
+> 🔬 **Deep dive — optional on first read.** Recording pulls in FFmpeg/GStreamer, RTP ports and hand-written SDP. On a first read, remember the idea: a PlainTransport consumes a producer and hands plain RTP to an external tool.
 
 mediasoup does not write files. It hands plain RTP to a tool that does. The recipe:
 
@@ -1157,6 +1262,55 @@ Notes for real recorders:
 - (4) The server needs a `produceData` handler, plus a `newDataProducer` notification → `consumeData` on each peer's recv transport. The client uses `sendTransport.on('producedata', ...)`.
 - (5) Allocate distinct RTP ports per recording (keep a port pool). Always `SIGINT` FFmpeg, never `SIGKILL`, or the WebM has no cues.
 </details>
+
+## Check your understanding
+
+1. **Conceptual.** Five people are in a room, each publishing a camera **and** a microphone. How many transports, producers and consumers exist on the server? How many times does each browser upload its video?
+
+   <details><summary>Answer</summary>
+
+   Transports: 5 × 2 = **10** (one send and one recv per person). Producers: 5 × 2 = **10**. Consumers: each of the 10 producers is consumed by the 4 *other* people, so 10 × 4 = **40** (20 video + 20 audio). Each browser uploads its video **once**, possibly as several simulcast layers of the same track. Compare that with 4 uploads in a mesh.
+   </details>
+
+2. **What happens if…** the server creates video consumers with `paused: false` instead of `paused: true`?
+
+   <details><summary>Answer</summary>
+
+   Media can start flowing before the browser has called `recvTransport.consume()`, so the browser has nowhere to put those packets and drops them, *including the first keyframe*. Video decoders can't start without a keyframe, so the tile stays black until the sender happens to send the next one, which can take seconds. With `paused: true`, the client calls `resumeConsumer` once it is ready, and mediasoup requests a fresh keyframe at that moment.
+   </details>
+
+3. **Read the code.** What is wrong with this client code, and what does the user see?
+
+   ```js
+   sendTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+     await request('connectTransport', { transportId: sendTransport.id, dtlsParameters });
+   });
+   ```
+
+   <details><summary>Answer</summary>
+
+   It never calls `callback()` (or `errback()` on failure). mediasoup-client waits for one of them before it continues, so the `sendTransport.produce()` that triggered `connect` **hangs forever**. There is no error and no video. The fix is `request(...).then(callback, errback)` (or `try { await ...; callback(); } catch (e) { errback(e); }`).
+   </details>
+
+4. **Read the code.** A server `consume` handler does this. What's the bug?
+
+   ```js
+   const consumer = await peer.recvTransport.consume({
+     producerId, rtpCapabilities: room.router.rtpCapabilities, paused: true,
+   });
+   ```
+
+   <details><summary>Answer</summary>
+
+   It passes the **router's** capabilities instead of the **receiving browser's** (`peer.rtpCapabilities`, which came from `device.recvRtpCapabilities` in `join`). mediasoup might then pick a codec or header extension the receiving browser can't handle, and that browser gets a track it can't decode. Use the peer's capabilities, and check `router.canConsume({ producerId, rtpCapabilities })` first.
+   </details>
+
+5. **What happens if…** you deploy on a cloud VM (private NIC `10.0.0.5`, public IP `203.0.113.10`) and leave `announcedAddress` unset?
+
+   <details><summary>Answer</summary>
+
+   Everything on the WebSocket works: capabilities, transports, join, produce, consume. But the ICE candidates the server sends contain `10.0.0.5`, which browsers on the internet can't reach, so ICE never completes. Every tile stays black and nothing shows up in the logs. Look at `iceCandidates` in the `createWebRtcTransport` reply to spot it, and set `announcedAddress` to the public IP (ch.12 §4.2).
+   </details>
 
 ## Key takeaways
 

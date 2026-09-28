@@ -1,6 +1,6 @@
 # Huddle
 
-**A Slack-lite real-time collaboration app: channels, presence, typing indicators, reactions, and video huddles.** It is the capstone of the *WebSockets in Node.js & Express* course and uses every chapter in one codebase you could actually run. The guided build-along is [Chapter 13, Capstone: Building Huddle](../docs/13-capstone-huddle.md).
+**A Slack-lite real-time collaboration app: channels, presence, typing indicators, reactions, and video huddles.** It is the capstone of the *WebSockets in Node.js & Express* course and uses every chapter in one codebase you could actually run. The guided build-along is [Chapter 13, Capstone: Building Huddle](../docs/13-capstone-huddle.md): ten milestones (config → auth → protocol → gateway → chat → browser client → mediasoup → signaling → video UI → metrics and tests), each ending with a checkpoint command you can run against this folder.
 
 ```
 ┌──────────────┬────────────────────────────────────────────────────┐

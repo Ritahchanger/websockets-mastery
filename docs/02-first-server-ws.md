@@ -4,6 +4,8 @@
 
 **What you'll learn:** How to build real WebSocket servers with [`ws`](https://github.com/websockets/ws), the fastest and most widely used WebSocket library for Node.js (Socket.IO, many GraphQL servers and countless frameworks sit on top of it). You'll learn the `WebSocketServer` options that matter, the `connection` / `message` / `close` / `error` events, the `message(data, isBinary)` signature introduced in `ws@8`, sending text and binary (`Buffer`, `ArrayBuffer`, typed arrays), broadcasting to `wss.clients` with proper `readyState` checks, per-connection state, and writing a **Node.js client** with the same library. The example is an echo + broadcast server with a browser client and an interactive terminal client.
 
+> **In plain English:** In Chapter 1 you saw every byte of the protocol; `ws` is the library that handles all those bytes so you don't have to. Think of it as a switchboard operator: it answers each incoming call (`connection`), hands you whatever the caller says (`message`), and tells you when they hang up (`close`). The key idea: **your job is only to decide what to do with each message and whom to send it to**, and a broadcast is just a loop over the open connections.
+
 ---
 
 ## 2.1 Why a library?
@@ -663,6 +665,46 @@ Browsers always *offer* deflate; with the option `false` (default), the server s
 - Ex 4: in the browser, `const b = new ArrayBuffer(9); const v = new DataView(b); v.setUint8(0, 1); v.setFloat64(1, Date.now());` (big-endian by default, matching `readDoubleBE`).
 - Ex 5: on `open`, `ws.send('/nick bot')`; in `message`, parse JSON and check `msg.kind === 'broadcast' && msg.text === 'ping'`.
 
+</details>
+
+---
+
+## Check your understanding
+
+1. In `ws@8`, what is the type of `data` in `ws.on('message', (data, isBinary) => ...)`, and why does `data === 'hello'` never match?
+<details><summary>Answer</summary>
+
+`data` is a `Buffer` (raw bytes), even for text frames. A `Buffer` is never `===` a string. Use `data.toString()` (and check `isBinary` to know whether it was a text or binary frame).
+</details>
+
+2. What happens if a socket emits `'error'` and you never attached `ws.on('error', ...)`?
+<details><summary>Answer</summary>
+
+An unhandled `'error'` event on an EventEmitter throws, which **crashes the whole Node process**, disconnecting every other client too. Always attach an error listener per socket.
+</details>
+
+3. Read the code: what's wrong here?
+
+   ```js
+   for (const client of wss.clients) {
+     client.send(JSON.stringify(bigState));
+   }
+   ```
+<details><summary>Answer</summary>
+
+Two things: `JSON.stringify` runs once **per client** (serialize once, before the loop), and there is no `readyState === WebSocket.OPEN` check, so it sends to sockets that are already closing.
+</details>
+
+4. You relay a message with `client.send(data)` where `data` is the Buffer you received. A browser client suddenly gets a `Blob` instead of a string. Why?
+<details><summary>Answer</summary>
+
+Sending a `Buffer` produces a **binary** frame, and browsers deliver binary frames as `Blob` by default. Relay with `client.send(data, { binary: isBinary })` so text stays text.
+</details>
+
+5. You store each socket's nickname in a `Map` on `connection`. What happens over a week if you forget `meta.delete(ws)` on `close`?
+<details><summary>Answer</summary>
+
+Every disconnected socket stays referenced by the Map, so neither it nor its metadata can be garbage-collected. Memory grows with every connection ever made: the classic WebSocket memory leak. Whatever you add on connect, remove on close.
 </details>
 
 ---

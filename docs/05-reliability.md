@@ -6,6 +6,8 @@
 
 > Prerequisites: [Chapter 2](./02-first-server-ws.md) (the `ws` API), [Chapter 3](./03-express-integration.md) (Express + `noServer` + the `upgrade` event), and [Chapter 4](./04-messaging-patterns.md) (the `{ type, id, payload, replyTo }` envelope and zod validation). Everything here builds on that protocol.
 
+> **In plain English:** Imagine a phone call where the line goes dead but you never hear a click, so you keep talking into silence. Network connections fail the same way, and this chapter is about noticing the silence fast (a [heartbeat](glossary.md#heartbeat)), redialling without everyone calling back at the same instant (backoff with [jitter](glossary.md#jitter)), and picking up the conversation exactly where it stopped (sequence numbers, replay, acks and [idempotency](glossary.md#idempotency)). It also covers not drowning a listener who can't keep up ([backpressure](glossary.md#backpressure)) and hanging up politely when the server restarts.
+
 ---
 
 ## 1. The core problem: connections fail silently
@@ -964,6 +966,71 @@ Try these experiments:
 - (3) `const all = [...wss.clients]; for (let i = 0; i < all.length; i += step) { … await sleep(300) }`.
 - (4) Browsers can't send WS ping frames, so it has to be an app-level message. Remember to count it as traffic for `isAlive` on the server.
 - (5) Guard against the race: the snapshot and the new live stream can overlap. Include each message's server id and dedup when merging.
+</details>
+
+---
+
+## Check your understanding
+
+1. A user's phone goes into a tunnel and loses signal. No FIN or RST packet is sent. **Without** any heartbeat, roughly how long until the server's `close` event fires on Linux, and why doesn't TCP keepalive fix this?
+
+<details><summary>Answer</summary>
+
+About **15 minutes**: the kernel keeps retransmitting until `tcp_retries2` is exhausted, and only then does `close` fire with `1006`. TCP keepalive doesn't help because its default idle time is 2 hours, its probes carry no data (so proxies like nginx still close the "idle" socket at 60 s), browsers can't configure it, and the kernel answers probes even when your app's event loop is stuck. You need an application-level heartbeat. See §1, "Why TCP keepalive isn't enough".
+
+</details>
+
+2. Spot the bug in this heartbeat sweep (assume `ws.on('pong', () => { ws.isAlive = true; })` is already wired up):
+
+   ```js
+   setInterval(() => {
+     for (const ws of wss.clients) {
+       if (ws.isAlive === false) { ws.close(); continue; }
+       ws.isAlive = false;
+       ws.ping();
+     }
+   }, 15_000);
+   ```
+
+<details><summary>Answer</summary>
+
+It calls `ws.close()` on a peer it has just decided is **dead**. `close()` starts the closing handshake and waits (30 s by default in `ws`) for a close frame the dead peer will never send, so the socket and its memory stay around. Use `ws.terminate()`, which destroys the socket right away. See §2, "Details that matter", and §9.
+
+</details>
+
+3. Your server restarts and 50,000 clients were connected. Each client reconnects with pure exponential backoff (`500 ms × 2^attempt`) but **no randomness**. What goes wrong, and what is the fix?
+
+<details><summary>Answer</summary>
+
+Every client was disconnected by the same event, so they all compute the same delays and retry **in sync**. The new process gets 50,000 TLS handshakes, upgrades and auth lookups in the same instant, falls over, and the cycle repeats (a *thundering herd*). The fix is **full jitter**: `delay = random(0, min(cap, base × 2^attempt))`. Also reset `attempt` only after the connection has been stable for a few seconds, not on `open`. See §3.
+
+</details>
+
+4. Read this client code. Why does the server's duplicate detection fail to catch resent messages?
+
+   ```js
+   function send(type, payload) {
+     const msg = { type, id: crypto.randomUUID(), payload };
+     ws.send(JSON.stringify(msg));
+     return msg;
+   }
+   function flushOutbox() {                    // called after reconnect
+     for (const { type, payload } of outbox.values()) send(type, payload);
+   }
+   ```
+
+<details><summary>Answer</summary>
+
+The message `id` is generated at **send** time, so every resend gets a **new** id. The server's seen-id set has never seen that id and processes the message again, so you get duplicates. Generate the id **once**, when the user acts, store the whole message (id included) in the outbox, and resend it unchanged. The server then skips the side effect for a known id but still acks. See §5 and the pitfall "Generating the message id at *send* time".
+
+</details>
+
+5. A client on a slow 2G connection subscribes to a feed that sends 100 messages per second, and your server just calls `ws.send()` for each one. What happens to the **server**, and what are your options?
+
+<details><summary>Answer</summary>
+
+`ws.send()` never blocks, so the unsent bytes pile up in memory: first the kernel buffer fills, then `ws.bufferedAmount` keeps growing. One slow client can grow your process's memory until it is OOM-killed. Watch `ws.bufferedAmount` and choose a policy per stream: **drop** volatile data above a soft limit, **conflate** to the latest value per key, **pause** the producer, or **disconnect** above a hard limit with `1013` (the client resumes from the replay buffer). See §6.
+
 </details>
 
 ---

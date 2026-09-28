@@ -4,6 +4,8 @@
 
 **What you'll learn:** A WebSocket gives you a pipe that carries *messages*; it says nothing about what those messages mean. This chapter is about designing the layer on top: a **message envelope** (`{ type, id, payload, replyTo }`) used throughout the rest of the course; **validating** every inbound message with `zod`; a **router/dispatcher** that maps message types to handler functions; **request/response** over a socket with correlation ids, a client-side promise map and timeouts; **rooms/channels** with `Map<room, Set<client>>`; **presence**, **typing indicators** and **broadcast-excluding-sender**; structured **error messages**; and when to use **binary** encodings such as MessagePack instead of JSON. You'll build a polished multi-room chat app with Express, `ws` and a vanilla-JS client.
 
+> **In plain English:** A WebSocket is a pipe that carries strings and bytes, but it has no idea what they mean, like a phone line that doesn't care which language you speak. This chapter agrees on a language: every message is a small JSON envelope with a `type` (what it is), an `id` (so replies can refer to it) and a `payload` (the data). The key idea: **with a shared envelope, validation and a dispatcher, you can build rooms, presence and request/response on top of a plain socket.**
+
 ---
 
 ## 4.1 Why you need a protocol
@@ -1420,6 +1422,40 @@ Also: `curl localhost:3000/api/rooms` shows the same room state over REST.
 - Ex 4: give the server its own `pending` map. In `dispatch`, a message of type `ok` with a known `replyTo` resolves it — handle that before the handler lookup.
 - Ex 5: in `dispatch`, route `isBinary` frames to a separate function instead of rejecting; relay with `client.ws.send(data, { binary: true })` to each room member except the sender. Keep a per-client room index array so a u8 can identify the room.
 
+</details>
+
+---
+
+## Check your understanding
+
+1. Why wrap every message in an envelope like `{ type, id, payload, replyTo }` instead of sending raw strings?
+<details><summary>Answer</summary>
+
+`type` tells the receiver what the message is so it can be routed to a handler, `id` lets replies refer to a specific request, and `payload` holds the data. The same shape works in both directions and gives you one place to validate and version the protocol.
+</details>
+
+2. A client calls `await request('room:join', ...)` and it rejects with a timeout. Did the server definitely not join the room?
+<details><summary>Answer</summary>
+
+No. The server may have done the work and the reply got lost (e.g. in a disconnect). Timeouts are **ambiguous**, so design operations to be **idempotent** (joining twice is harmless) or dedupe by `id` on the server.
+</details>
+
+3. Read the code: in the client `request()` helper, why is there a `ws.addEventListener('close', ...)` that rejects every entry in `pending`?
+<details><summary>Answer</summary>
+
+Once the socket closes, no replies will ever come. Without that loop, every waiting promise would hang until its timeout (or forever if there were none) and the Map would hold stale entries. Rejecting them all on close gives callers a fast, clear failure and frees memory.
+</details>
+
+4. What happens to memory if `leave(room, client)` never deletes a room whose Set became empty?
+<details><summary>Answer</summary>
+
+Every room name ever used stays in the `rooms` Map with an empty Set. With user-generated room names, that's an unbounded leak. Delete empty rooms (unless they are permanent).
+</details>
+
+5. Why does the server broadcast a chat message to everyone **except** the sender, and reply to the sender with an `ok` instead?
+<details><summary>Answer</summary>
+
+The sender already rendered the message optimistically. The `ok` reply (with `replyTo`) confirms it and supplies the server's id and timestamp, or reports an error. Sending the broadcast copy to the sender too would render it twice.
 </details>
 
 ---

@@ -4,6 +4,40 @@
 
 **What you'll learn.** In this chapter you build **Huddle**, a Slack-lite app with channels, presence, typing indicators, reactions and mediasoup video huddles. Every piece of the course fits into one codebase. You build it file by file, in the order you would write it yourself: config, auth tickets, the zod-validated protocol, a router, a connection hub, the WebSocket gateway (origin, tickets, heartbeats, rate limits), the chat domain (ring-buffer history with `seq` cursors, idempotent sends, TTL'd typing), and the mediasoup layer (worker pool with `died` recovery, `Room`/`Peer`, the full signaling protocol, active speaker). On the browser side you build a resilient `HuddleSocket` (backoff with jitter, promise requests, outbox, half-open detection), `HuddleMedia` on `mediasoup-client`, and one-round-trip resync after reconnects. The chapter ends with tests that run the real browser classes in Node, including full mediasoup signaling on a fake WebRTC handler. **Every important file appears in full below**, so the chapter alone is enough to rebuild Huddle. The finished code lives in [`project/`](../project/).
 
+> **In plain English:** Huddle is a small Slack: people log in with a nickname, chat in channels, see who is online and who is typing, and can start a video call in any channel. You build it in ten milestones. Each one adds a layer, and each ends with a command you run to prove the layer works before you stack the next one on top. Nothing here is new: every milestone applies one or two earlier chapters. What's new is seeing all of them cooperate in one process, and learning which small decisions (a sequence number, an idempotency key, a paused consumer) make the difference between a demo and something that survives flaky Wi-Fi.
+
+> **How to use this chapter**
+>
+> - **Two ways to follow along.** *Read-along:* the finished code is in [`project/`](../project/), so you can read each milestone and run its checkpoint against the real files. *Build-along:* create an empty folder, type (or copy) each file as its milestone introduces it, and run the same checkpoints there. Every code block labelled **`project/…`** is the complete file, identical to the one in `project/`.
+> - **Run everything from `project/`** after `npm install` (Node 22 or newer, because the Node-side probes use the global `WebSocket`). Commands that start a server use two terminals: **Terminal A** runs the server, **Terminal B** runs the probe. Stop a server with `Ctrl+C`.
+> - **Throwaway harnesses.** The real entry point, `src/server.js`, imports every layer, so it only runs at the end (M10). Until then, each checkpoint uses a 20-line harness that wires up only the layers built so far. Put them in `project/scratch/` (create the folder, and delete it when you're done; it is not part of Huddle). Harnesses listen on port **3001** so they never clash with a real Huddle on 3000.
+> - **Honest checkpoints.** Where a milestone can't run on its own yet, the checkpoint says so and gives you the next-best check instead: a script that exercises only the new files, a single test file, or (for code that can't run alone) `node --check <file>` to catch syntax errors.
+> - **Budget about 10 hours** in total. The times below assume you read the prose and run each checkpoint; typing everything in yourself takes longer.
+
+### Milestone roadmap
+
+| # | Milestone | Files you write | Course chapter it applies | Est. time |
+|---|---|---|---|---|
+| [M1](#133-m1--skeleton-and-config) | Skeleton & config | `package.json`, `src/config.js`, `src/logger.js` | 3 (one server, one port), 12 (env-driven config) | 30 min |
+| [M2](#134-m2--login-and-tickets) | Login + tickets | `src/auth.js` | 6 (JWTs, one-time tickets) | 45 min |
+| [M3](#135-m3--protocol-and-router) | Protocol & router | `src/ws/protocol.js`, `src/ws/router.js` | 4 (envelope, dispatch, `replyTo`), 6 (validation) | 45 min |
+| [M4](#136-m4--the-websocket-gateway-auth-heartbeat-rate-limit) | WS gateway: auth, heartbeat, rate limit | `src/ws/rateLimit.js`, `src/ws/hub.js`, `src/ws/gateway.js` | 2 (`ws` events), 3 (`noServer` + `upgrade`), 5 (heartbeats, backpressure), 6 (origin, rate limits) | 60 min |
+| [M5](#137-m5--chat-channels-history-presence-typing-reactions) | Chat: channels, history, presence, typing, reactions | `src/chat/ringBuffer.js`, `channels.js`, `typing.js`, `presence.js`, `handlers.js` | 4 (rooms, presence), 5 (replay with `seq`, idempotency) | 90 min |
+| [M6](#138-m6--browser-client-reconnect-and-resync) | Browser client & reconnect/resync | `public/src/api.js`, `ws-client.js`, `main.js` (chat parts), `dom.js` | 4 (request/response), 5 (backoff, resync), 6 (escaping output) | 90 min |
+| [M7](#139-m7--mediasoup-worker-pool-room-and-peer) | mediasoup worker pool, Room, Peer | `src/media/codecs.js`, `workerPool.js`, `Peer.js`, `Room.js` | 11 (Workers, Routers, AudioLevelObserver), 12 (one worker per core) | 45 min |
+| [M8](#1310-m8--media-signaling-handlers) | Media signaling handlers | `src/media/handlers.js`, `src/media/index.js` | 10 (WebSocket as the signaling plane), 11 (transports, produce/consume) | 75 min |
+| [M9](#1311-m9--video-ui) | Video UI | `public/src/media-client.js`, `main.js` (huddle parts), `huddle-view.js` | 10 (`getUserMedia`, tracks), 11 (`mediasoup-client`) | 60 min |
+| [M10](#1312-m10--metrics-composition-root-tests-hardening) | Metrics, tests, hardening | `src/metrics.js`, `src/server.js`, `test/*.test.js` | 9 (testing, observability), 12 (shutdown, headers, deployment) | 60 min |
+
+```mermaid
+flowchart LR
+  M1[M1 config] --> M2[M2 auth] --> M3[M3 protocol + router] --> M4[M4 gateway + hub]
+  M4 --> M5[M5 chat] --> M6[M6 browser client]
+  M4 --> M7[M7 workers + rooms] --> M8[M8 media signaling] --> M9[M9 video UI]
+  M6 --> M9
+  M5 & M8 --> M10[M10 metrics · server.js · tests]
+```
+
 ---
 
 ## 13.1 What we're building
@@ -83,7 +117,11 @@ project/
 
 ---
 
-## 13.3 Step 0 — Package and configuration
+## 13.3 M1 — Skeleton and config
+
+**Goal:** a package that installs, and a single `loadConfig()` that every other file will receive as an argument instead of reading `process.env` itself.
+
+**Files you'll write:** `project/package.json`, `project/src/config.js`, `project/src/logger.js`.
 
 Huddle has its own `package.json`, separate from the course root, because it has a build step (esbuild bundles `mediasoup-client` for the browser) and a native dependency (`mediasoup` downloads or compiles a C++ worker).
 
@@ -223,7 +261,7 @@ export function loadConfig(overrides = {}, env = process.env) {
 }
 ```
 
-Three decisions matter here:
+Four decisions matter here:
 
 1. **Refuse to boot in production without `JWT_SECRET`.** A random fallback would log everyone out on every deploy. A constant fallback in production would be a security hole.
 2. **Port range, not a single port.** Each WebRTC transport binds its own UDP/TCP port from `RTC_MIN_PORT..RTC_MAX_PORT`. That's the range you open in the firewall. (Chapter 11 also covers `WebRtcServer`, which uses one port per worker, as an alternative.)
@@ -258,9 +296,39 @@ export const logger = {
 };
 ```
 
+### ✅ Checkpoint: run this and you should see…
+
+Run from `project/` (after `npm install`):
+
+```bash
+node -e "import('./src/config.js').then(({ loadConfig }) => { const c = loadConfig({ ws: { heartbeatMs: 50 } }); console.log({ port: c.port, heartbeatMs: c.ws.heartbeatMs, maxPayload: c.ws.maxPayload, announcedIp: c.media.announcedIp }); })"
+NODE_ENV=production node -e "import('./src/config.js').then((m) => m.loadConfig())" 2>&1 | grep '^Error'
+node -e "import('./src/logger.js').then(({ logger }) => logger.info('hello from logger', { milestone: 1 }))"
+NODE_ENV=production node -e "import('./src/logger.js').then(({ logger }) => logger.info('hello from logger', { milestone: 1 }))"
+```
+
+You should see, in order: the override applied while the other `ws.*` defaults survive (`heartbeatMs: 50`, `maxPayload: 65536`) plus your LAN IP as `announcedIp`; the production guard firing; then the same log line pretty-printed and as JSON:
+
+```
+{ port: 3000, heartbeatMs: 50, maxPayload: 65536, announcedIp: '192.168.1.68' }
+Error: JWT_SECRET must be set in production
+09:41:07.438 INFO  hello from logger {"milestone":1}
+{"t":"2026-09-28T09:41:07.461Z","level":"info","msg":"hello from logger","milestone":1}
+```
+
+**If it doesn't work**
+
+- *`SyntaxError: Cannot use import statement outside a module`*: `package.json` is missing `"type": "module"`, or you ran the command outside `project/`.
+- *`npm install` fails while building mediasoup*: there was no prebuilt worker for your platform, so it tried to compile one. Install `python3`, `make` and a C++ compiler, or carry on: chat (M1–M6) doesn't need mediasoup, and M8 shows how Huddle runs without it.
+- *`announcedIp: '127.0.0.1'`*: the machine has no non-internal IPv4 interface. That's fine for localhost-only testing. For other devices, set `MEDIASOUP_ANNOUNCED_IP`.
+
 ---
 
-## 13.4 Step 1 — Auth: JWTs over HTTP, tickets over WebSocket
+## 13.4 M2 — Login and tickets
+
+**Goal:** two HTTP endpoints. `POST /api/login` trades a nickname for a long-lived JWT, and `POST /api/ticket` trades that JWT for a 30-second, single-use WebSocket ticket.
+
+**Files you'll write:** `project/src/auth.js`.
 
 The browser's `new WebSocket(url)` **cannot set headers**, so the credential has to go in the URL, and URLs end up in proxy logs, browser history and `Referer` headers. Chapter 6's answer is a two-credential design:
 
@@ -413,9 +481,59 @@ Notes:
 - The nickname regex uses Unicode classes (`\p{L}`), so `José` and `Zoë` work but `<script>` doesn't. Output escaping still matters (see `dom.js`). Validate input and escape output: do both, not one.
 - `TicketStore` is a `Map` with a sweeper. When you scale out (Exercise 2), the same interface maps to Redis `SET ticket user EX 30` plus `GETDEL`.
 
+### ✅ Checkpoint: run this and you should see…
+
+First, the ticket store on its own. A ticket works exactly once:
+
+```bash
+node -e "import('./src/auth.js').then(({ TicketStore }) => { const s = new TicketStore(); const { ticket } = s.issue({ id: 'u_1', name: 'ada' }); console.log(s.consume(ticket), s.consume(ticket)); s.close(); })"
+# { id: 'u_1', name: 'ada' } null
+```
+
+Then the HTTP side. There's no `server.js` yet, so mount the auth router on a bare Express app:
+
+**`scratch/m2-auth.mjs`** *(throwaway harness, not part of Huddle)*
+
+```js
+// Throwaway harness for M2: only Express + the auth router.
+import express from 'express';
+import { loadConfig } from '../src/config.js';
+import { createAuth } from '../src/auth.js';
+
+const auth = createAuth(loadConfig());
+const app = express();
+app.use(express.json({ limit: '8kb' }));
+app.use('/api', auth.router);
+app.listen(3001, () => console.log('M2 auth harness on http://localhost:3001'));
+```
+
+```bash
+# Terminal A
+node scratch/m2-auth.mjs
+
+# Terminal B
+curl -s -XPOST localhost:3001/api/login -H 'content-type: application/json' -d '{"nickname":"ada"}'
+curl -s -XPOST localhost:3001/api/login -H 'content-type: application/json' -d '{"nickname":"<script>"}'
+TOKEN=$(curl -s -XPOST localhost:3001/api/login -H 'content-type: application/json' -d '{"nickname":"ada"}' | node -pe 'JSON.parse(require("fs").readFileSync(0, "utf8")).token')
+curl -s -XPOST localhost:3001/api/ticket -H "authorization: Bearer $TOKEN"
+curl -si -XPOST localhost:3001/api/ticket | head -1
+```
+
+You should see a `{"token":"eyJ…","user":{…}}` for `ada`, `{"error":"invalid_nickname",…}` for `<script>`, a `{"ticket":"…","expiresIn":30}`, and `HTTP/1.1 401 Unauthorized` when the `Authorization` header is missing.
+
+**If it doesn't work**
+
+- *Login always answers `400 invalid_nickname`*: the body didn't parse. Check the `content-type: application/json` header and that the harness has `app.use(express.json())` **before** the router.
+- *`/api/ticket` answers `invalid_token` for a token you just got*: under `NODE_ENV=test` the secret is random per process, so a token from one run is invalid in the next. Log in again (or unset `NODE_ENV`).
+- *`EADDRINUSE :::3001`*: an older harness is still running. Stop it with `Ctrl+C` in its terminal, or find it with `lsof -i :3001`.
+
 ---
 
-## 13.5 Step 2 — The protocol
+## 13.5 M3 — Protocol and router
+
+**Goal:** turn "some bytes arrived" into "a validated `chat:send` with a trimmed `text`", and turn a handler's return value (or thrown error) into exactly one reply frame. After this milestone, no feature code ever touches JSON.
+
+**Files you'll write:** `project/src/ws/protocol.js`, `project/src/ws/router.js`.
 
 Everything on the wire is one envelope (Chapter 4): `{ type, id, payload, replyTo? }`. Client-to-server frames are **requests**: every one gets exactly one `ok` or `error` frame back with `replyTo = id`, except notifications like `typing:start`, which only get a reply on error. Server-to-client frames without `replyTo` are **events**.
 
@@ -611,9 +729,7 @@ Design decisions:
 | `media:activeSpeaker` | `{peerId\|null, volume?}` | Room peers |
 | `media:roomClosed` | `{roomId, reason}` | Room peers (for example `worker_died`) |
 
----
-
-## 13.6 Step 3 — The router and the rate limiter
+### The router
 
 The router is where "a validated message" becomes "a feature". Handlers return data or throw. The router turns that into exactly one reply:
 
@@ -673,6 +789,86 @@ export class MessageRouter {
 
 A `ProtocolError` is an expected failure (such as "channel not found"), and its message is shown to the user. Any other exception is a bug: it gets logged with the stack trace, and the client only sees `internal`, so no stack traces leak to users.
 
+### ✅ Checkpoint: run this and you should see…
+
+There are no sockets yet, but you don't need them: the router only calls `client.send(envelope)`, so a fake client that prints is enough.
+
+**`scratch/m3-router.mjs`** *(throwaway harness, not part of Huddle)*
+
+```js
+// Throwaway harness for M3: feed raw frames through parse -> router, no sockets.
+import { parseClientMessage, ProtocolError, errorReply } from '../src/ws/protocol.js';
+import { MessageRouter } from '../src/ws/router.js';
+
+const router = new MessageRouter()
+  .on('channel:join', ({ payload }) => ({ joined: payload.channelId }))
+  .on('channel:leave', () => {
+    throw new ProtocolError('not_found', 'No channel #nope');
+  })
+  .on('typing:start', () => {}, { notify: true });
+
+// A fake Client: the router only ever calls client.send(envelope).
+const client = { send: (msg) => console.log('->', JSON.stringify(msg)) };
+
+const frames = [
+  '{"type":"channel:join","id":"1","payload":{"channelId":"general"}}',
+  '{"type":"channel:leave","id":"2","payload":{"channelId":"nope"}}',
+  '{"type":"typing:start","id":"3","payload":{"channelId":"general"}}',
+  '{"type":"chat:send","id":"4","payload":{"channelId":"general","text":"hi","user":"admin"}}',
+  '{"type":"admin:nuke","id":"5"}',
+  'not json',
+];
+for (const raw of frames) {
+  console.log('<-', raw);
+  try {
+    await router.dispatch(client, parseClientMessage(raw));
+  } catch (err) {
+    // In the real server the gateway does this (M4).
+    client.send(errorReply(err.details?.id, err.code, err.message));
+  }
+}
+```
+
+```bash
+node scratch/m3-router.mjs
+```
+
+You should see one reply per request (ids and UUIDs differ):
+
+```
+<- {"type":"channel:join","id":"1","payload":{"channelId":"general"}}
+-> {"type":"ok","id":"8bb8…","payload":{"joined":"general"},"replyTo":"1"}
+<- {"type":"channel:leave","id":"2","payload":{"channelId":"nope"}}
+-> {"type":"error","id":"b697…","payload":{"code":"not_found","message":"No channel #nope"},"replyTo":"2"}
+<- {"type":"typing:start","id":"3","payload":{"channelId":"general"}}
+<- {"type":"chat:send","id":"4","payload":{"channelId":"general","text":"hi","user":"admin"}}
+-> {"type":"error","id":"c0bf…","payload":{"code":"bad_payload","message":"(root): Unrecognized key(s) in object: 'user'"},"replyTo":"4"}
+<- {"type":"admin:nuke","id":"5"}
+-> {"type":"error","id":"3e99…","payload":{"code":"unknown_type","message":"Unknown message type \"admin:nuke\""},"replyTo":"5"}
+<- not json
+-> {"type":"error","id":"27a3…","payload":{"code":"bad_json","message":"Frame is not valid JSON"}}
+```
+
+Notice the three behaviours: `typing:start` (a notification) gets **no** reply, the smuggled `user` field is refused by `.strict()`, and garbage gets an error without a `replyTo` because there's no id to echo.
+
+**If it doesn't work**
+
+- *A new message type you added comes back `unknown_type`*: add its schema to `ClientMessages`. The registry is the allow-list; a handler without a schema is unreachable.
+- *A request never gets a reply*: it was registered with `{ notify: true }`, or the handler returned a promise that never settles.
+- *`Error: Handler for … already registered`*: two `router.on()` calls for the same type. Each type has exactly one owner.
+
+The unit tests for this layer live in `test/protocol.test.js`. That file also imports `RingBuffer` (M5) and `TokenBucket` (M4), so in a build-along it runs from M5 on.
+
+---
+
+## 13.6 M4 — The WebSocket gateway: auth, heartbeat, rate limit
+
+**Goal:** the only door into the real-time side. The HTTP `upgrade` is checked (path, origin, ticket) **before** the handshake, and every accepted socket gets a heartbeat, a token bucket and a slow-consumer cut-off. The hub keeps track of who is connected.
+
+**Files you'll write:** `project/src/ws/rateLimit.js`, `project/src/ws/hub.js`, `project/src/ws/gateway.js`.
+
+### The rate limiter
+
 The rate limiter is a textbook token bucket (Chapter 6). Joining a huddle fires about 8 requests in 100 ms, so a fixed-window limiter tuned for chat would block that. A bucket with `burst=40, rate=15/s` lets the burst through and still caps a flood:
 
 **`project/src/ws/rateLimit.js`**
@@ -703,9 +899,7 @@ export class TokenBucket {
 
 Injecting `now` makes it deterministic in tests (see `protocol.test.js`).
 
----
-
-## 13.7 Step 4 — The hub: connections, users, broadcast, backpressure
+### The hub: connections, users, broadcast, backpressure
 
 **`project/src/ws/hub.js`**
 
@@ -808,9 +1002,7 @@ export class Hub extends EventEmitter {
 - **Serialize once.** `broadcast()` calls `JSON.stringify` once, then sends the same string to N sockets. In a 500-member channel that's 1 stringify instead of 500.
 - **Slow consumers get cut off.** If a client's `bufferedAmount` passes 4 MB (a stalled mobile connection, a frozen tab), we `terminate()` it instead of letting Node buffer without limit. It reconnects and resyncs, which is cheaper than an OOM (Chapter 5).
 
----
-
-## 13.8 Step 5 — The gateway
+### The gateway
 
 This is the most security-sensitive file. It runs `ws` in `noServer` mode (Chapter 3) so that **we** decide, before the handshake, whether a socket gets upgraded at all:
 
@@ -998,9 +1190,124 @@ Points worth studying:
 - **Any inbound message counts as liveness**, not only pongs. That's cheap, and it helps clients behind proxies that delay control frames.
 - **Rate-limited replies still correlate.** `peekId` pulls the `id` out of the raw frame with a regex, without parsing it, so the client's pending promise rejects with `rate_limited` instead of timing out. After `maxViolations`, the socket is closed with 1008 (policy violation).
 
+### ✅ Checkpoint: run this and you should see…
+
+This harness is the real gateway, hub and router, with a stand-in `session:welcome` (chat adds the real one in M5) and a metrics stub that prints each rejection. The heartbeat is shortened to 5 s so you can watch it.
+
+**`scratch/m4-gateway.mjs`** *(throwaway harness, not part of Huddle)*
+
+```js
+// Throwaway harness for M4: HTTP auth + the real gateway, hub and router.
+// No chat yet, so we register a single sys:ping handler and a stand-in welcome.
+import http from 'node:http';
+import express from 'express';
+import { loadConfig } from '../src/config.js';
+import { createAuth } from '../src/auth.js';
+import { Hub } from '../src/ws/hub.js';
+import { MessageRouter } from '../src/ws/router.js';
+import { createGateway } from '../src/ws/gateway.js';
+
+const config = loadConfig({ ws: { heartbeatMs: 5_000 } });
+const app = express();
+const server = http.createServer(app);
+const auth = createAuth(config);
+const hub = new Hub();
+const router = new MessageRouter();
+const metrics = { countIn() {}, countOut() {}, countRejected: (why) => console.log('rejected:', why) };
+
+app.use(express.json({ limit: '8kb' }));
+app.use('/api', auth.router);
+router.on('sys:ping', ({ payload }) => ({ t: payload.t, serverTime: Date.now() }));
+hub.on('connect', (client) => client.event('session:welcome', { user: client.user, clientId: client.id }));
+hub.on('disconnect', (client) => console.log('disconnect', client.id));
+
+createGateway({ server, config, tickets: auth.tickets, router, hub, metrics });
+server.listen(3001, () => console.log('M4 gateway harness on http://localhost:3001'));
+```
+
+The probe logs in, fetches a ticket and opens a real WebSocket. You'll reuse it later.
+
+**`scratch/probe.mjs`** *(throwaway probe client)*
+
+```js
+// Log in, get a ticket, open a WebSocket and print every frame.
+// Usage: node scratch/probe.mjs [nickname] [flood]
+const base = 'http://localhost:3001';
+const [nickname = 'ada', mode] = process.argv.slice(2);
+const post = (path, body, token) =>
+  fetch(base + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token && { authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(body ?? {}),
+  }).then((r) => r.json());
+
+const { token } = await post('/api/login', { nickname });
+const { ticket } = await post('/api/ticket', {}, token);
+const ws = new WebSocket(`${base.replace('http', 'ws')}/ws?ticket=${ticket}`);
+const send = (type, payload = {}, id = crypto.randomUUID()) => ws.send(JSON.stringify({ type, id, payload }));
+const counts = {};
+
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (mode === 'flood') counts[msg.payload.code ?? msg.type] = (counts[msg.payload.code ?? msg.type] ?? 0) + 1;
+  else console.log('<-', e.data.slice(0, 160));
+};
+ws.onopen = () => {
+  if (mode === 'flood') for (let i = 0; i < 60; i++) send('sys:ping', { t: i });
+  else {
+    send('sys:ping', { t: Date.now() }, 'ping-1');
+    ws.send('this is not json');
+  }
+  setTimeout(() => {
+    if (mode === 'flood') console.log(counts);
+    ws.close();
+  }, 500);
+};
+ws.onclose = (e) => console.log('closed', e.code);
+```
+
+```bash
+# Terminal A
+node scratch/m4-gateway.mjs
+
+# Terminal B
+node scratch/probe.mjs ada            # welcome, a ping reply, a bad_json error
+node scratch/probe.mjs ada flood      # 60 pings at once against a 40-token bucket
+H='-H Connection:Upgrade -H Upgrade:websocket -H Sec-WebSocket-Version:13 -H Sec-WebSocket-Key:dGhlIHNhbXBsZSBub25jZQ=='
+curl -si $H 'localhost:3001/ws?ticket=nope' | head -1
+curl -si $H 'localhost:3001/nope' | head -1
+curl -si $H -H 'Origin: https://evil.example' 'localhost:3001/ws?ticket=nope' | head -1
+```
+
+You should see, in Terminal B:
+
+```
+<- {"type":"session:welcome",…}
+<- {"type":"ok",…,"payload":{"t":…,"serverTime":…},"replyTo":"ping-1"}
+<- {"type":"error",…,"payload":{"code":"bad_json","message":"Frame is not valid JSON"}}
+closed 1005
+{ 'session:welcome': 1, ok: 40, rate_limited: 20 }
+closed 1005
+HTTP/1.1 401 Unauthorized
+HTTP/1.1 404 Not Found
+HTTP/1.1 403 Forbidden
+```
+
+and in Terminal A, `ws connected` / `ws closed` lines plus `rejected: invalid`, twenty `rejected: rate`, `rejected: ticket` and `rejected: origin`. The flood result is the token bucket at work: exactly `rateBurst` (40) requests go through, and the rest are answered with `rate_limited` rather than silently dropped. To see the heartbeat, run `LOG_LEVEL=debug`, leave a probe connected, and notice it survives: the `ws` client answers pings automatically, so only a truly dead peer gets `heartbeat timeout`.
+
+**If it doesn't work**
+
+- *The probe gets `401` on the upgrade*: tickets are single-use and last 30 s. Fetch a new one for every connection attempt; never reuse the one from a previous run.
+- *A browser on another machine gets `403`*: its `Origin` is neither the page's host nor localhost. Add it to `ALLOWED_ORIGINS`.
+- *No `rate_limited` in the flood*: you probably have `RATE_BURST` or `RATE_PER_SEC` set in your environment. Run `env | grep RATE`.
+
 ---
 
-## 13.9 Step 6 — The chat domain
+## 13.7 M5 — Chat: channels, history, presence, typing, reactions
+
+**Goal:** the first real feature. Channels keep a bounded history in which every message has a per-channel `seq` (the resync cursor for M6). Sends are idempotent, typing expires on its own, and presence is derived from the hub.
+
+**Files you'll write:** `project/src/chat/ringBuffer.js`, `project/src/chat/channels.js`, `project/src/chat/typing.js`, `project/src/chat/presence.js`, `project/src/chat/handlers.js`.
 
 ### History: a ring buffer with sequence numbers
 
@@ -1370,14 +1677,724 @@ export function registerChat({ router, hub, config, getHuddles = () => [] }) {
 
 Things to notice:
 
-- **`session:welcome` is a full snapshot.** Channels, presence, huddles, plus an `epoch`. When the client sees a *different* epoch on a later welcome, the server restarted and lost its in-memory history, so seq cursors are meaningless and the client re-fetches everything (13.12).
+- **`session:welcome` is a full snapshot.** Channels, presence, huddles, plus an `epoch`. When the client sees a *different* epoch on a later welcome, the server restarted and lost its in-memory history, so seq cursors are meaningless and the client re-fetches everything (M6, section 13.8).
 - **`sys:resync` batches the catch-up.** A client in 10 channels makes one request instead of 10 `channel:join`s.
 - **The sender gets the message twice**: in the `ok` reply and in the `chat:message` broadcast (for their *other* tabs). The client de-duplicates by `clientMsgId` and then by `id`.
 - **Membership is checked** before `chat:send` and `typing:start`. Validation proves the shape is right. Authorization is a separate question.
 
+### ✅ Checkpoint: run this and you should see…
+
+Two checks. First, all of `test/protocol.test.js`'s imports now exist:
+
+```bash
+NODE_ENV=test node --test test/protocol.test.js      # ℹ tests 10 · ℹ pass 10
+```
+
+Second, swap the stand-ins in the M4 harness for the real chat domain:
+
+**`scratch/m5-chat.mjs`** *(throwaway harness, not part of Huddle)*
+
+```js
+// Throwaway harness for M5: the M4 harness plus the real chat domain.
+import http from 'node:http';
+import express from 'express';
+import { loadConfig } from '../src/config.js';
+import { createAuth } from '../src/auth.js';
+import { Hub } from '../src/ws/hub.js';
+import { MessageRouter } from '../src/ws/router.js';
+import { createGateway } from '../src/ws/gateway.js';
+import { registerChat } from '../src/chat/handlers.js';
+
+const config = loadConfig();
+const app = express();
+const server = http.createServer(app);
+const auth = createAuth(config);
+const hub = new Hub();
+const router = new MessageRouter();
+const metrics = { countIn() {}, countOut() {}, countRejected() {} };
+
+app.use(express.json({ limit: '8kb' }));
+app.use('/api', auth.router);
+registerChat({ router, hub, config }); // registers sys:ping, sys:resync, channel:*, chat:*, typing:*, presence:*
+
+createGateway({ server, config, tickets: auth.tickets, router, hub, metrics });
+server.listen(3001, () => console.log('M5 chat harness on http://localhost:3001'));
+```
+
+The chat probe connects two users. Bob listens while Alice types, sends one message **twice** with the same `clientMsgId` (a simulated retry), reacts to it, and then tries a channel she never joined:
+
+**`scratch/chat-probe.mjs`** *(throwaway probe client)*
+
+```js
+// Two users in #general. Bob prints every event he receives while Alice
+// types, sends the same message twice (same clientMsgId) and reacts to it.
+const base = 'http://localhost:3001';
+const post = (path, body, token) =>
+  fetch(base + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token && { authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(body ?? {}),
+  }).then((r) => r.json());
+
+async function connect(nickname, onEvent) {
+  const { token } = await post('/api/login', { nickname });
+  const { ticket } = await post('/api/ticket', {}, token);
+  const ws = new WebSocket(`ws://localhost:3001/ws?ticket=${ticket}`);
+  const pending = new Map();
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.replyTo) return pending.get(msg.replyTo)?.(msg);
+    onEvent?.(msg);
+  };
+  await new Promise((r) => (ws.onopen = r));
+  const request = (type, payload = {}) =>
+    new Promise((resolve) => {
+      const id = crypto.randomUUID();
+      pending.set(id, resolve);
+      ws.send(JSON.stringify({ type, id, payload }));
+    });
+  return { ws, request };
+}
+
+const bob = await connect('bob', (m) => console.log('bob <-', m.type, JSON.stringify(m.payload).slice(0, 110)));
+await bob.request('channel:join', { channelId: 'general' });
+const alice = await connect('alice');
+await alice.request('channel:join', { channelId: 'general' });
+
+alice.ws.send(JSON.stringify({ type: 'typing:start', id: 't1', payload: { channelId: 'general' } }));
+const first = await alice.request('chat:send', { channelId: 'general', text: 'hello **bob**', clientMsgId: 'm-1' });
+const retry = await alice.request('chat:send', { channelId: 'general', text: 'hello **bob**', clientMsgId: 'm-1' });
+console.log('alice: seq', first.payload.message.seq, 'retry duplicate =', retry.payload.duplicate);
+await alice.request('chat:react', { channelId: 'general', messageId: first.payload.message.id, emoji: '👍' });
+const notMember = await alice.request('chat:send', { channelId: 'random', text: 'hi' });
+console.log('alice -> #random without joining:', notMember.payload.code);
+
+setTimeout(() => {
+  alice.ws.close();
+  setTimeout(() => bob.ws.close(), 200);
+}, 200);
+```
+
+```bash
+# Terminal A
+node scratch/m5-chat.mjs
+
+# Terminal B
+node scratch/chat-probe.mjs
+```
+
+You should see:
+
+```
+bob <- session:welcome {"user":{…,"name":"bob",…},"clientId":"c_…","epoch":"626c2c7b","serverT…
+bob <- presence:update {"user":{…,"name":"alice",…},"status":"online"}
+bob <- typing:update {"channelId":"general","users":[{…,"name":"alice",…}]}
+bob <- typing:update {"channelId":"general","users":[]}
+bob <- chat:message {"message":{"id":"…","seq":1,"channelId":"general",…
+alice: seq 1 retry duplicate = true
+bob <- chat:reaction {"channelId":"general","messageId":"…","reactions":{"👍":["u_…"]}}
+alice -> #random without joining: not_member
+bob <- presence:update {"user":{…,"name":"alice",…},"status":"offline"}
+```
+
+The line that matters most is the one that is **missing**: Bob gets exactly one `chat:message` even though Alice sent twice. The typing indicator clears on its own because sending a message stops typing. Run the probe again without restarting the harness and you'll see `seq 2`, which is the counter M6 uses to resync.
+
+**If it doesn't work**
+
+- *`not_member` on `chat:send`*: every connection must `channel:join` first. Validation proves the shape is right, and membership is a separate authorization check.
+- *Bob sees no `typing:update`*: Bob has to join `#general` **before** Alice types. Typing and chat events go to channel members only.
+- *`protocol.test.js` fails with `Cannot find module …/ringBuffer.js`*: that's a missing file from this milestone, not a test bug.
+
 ---
 
-## 13.10 Step 7 — Video huddles with mediasoup
+## 13.8 M6 — Browser client, reconnect and resync
+
+**Goal:** the browser half of chat. `api.js` handles HTTP credentials, `HuddleSocket` stays connected through anything the network does, and `main.js` makes the UI *correct* after a reconnect: no lost messages, no duplicates, no stale history.
+
+**Files you'll write:** `project/public/src/api.js`, `project/public/src/ws-client.js`, the chat parts of `project/public/src/main.js`, and `project/public/src/dom.js`. (`index.html`, `styles.css` and `icons.js` are plain layout; copy them from `project/public/`.)
+
+### `api.js`: login and tickets
+
+**`project/public/src/api.js`**
+
+```js
+// HTTP side of auth. The JWT lives in sessionStorage (per tab) and is only
+// ever sent in an Authorization header — never in a WebSocket URL.
+const KEY = 'huddle.session';
+
+export class AuthError extends Error {
+  fatal = true;
+}
+
+export function loadSession() {
+  try {
+    return JSON.parse(sessionStorage.getItem(KEY));
+  } catch {
+    return null;
+  }
+}
+
+export function saveSession(session) {
+  try {
+    if (session) sessionStorage.setItem(KEY, JSON.stringify(session));
+    else sessionStorage.removeItem(KEY);
+  } catch {
+    /* private mode: session lives in memory only */
+  }
+}
+
+async function post(path, body, token) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token && { Authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(body ?? {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) throw new AuthError(data.error ?? 'unauthorized');
+  if (!res.ok) throw new Error(data.message ?? data.error ?? `HTTP ${res.status}`);
+  return data;
+}
+
+export const login = (nickname) => post('/api/login', { nickname });
+
+/** Build the WebSocket URL with a fresh one-time ticket. */
+export async function wsUrl(token, path = '/ws') {
+  const { ticket } = await post('/api/ticket', {}, token);
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}${path}?ticket=${encodeURIComponent(ticket)}`;
+}
+
+export async function serverConfig() {
+  const res = await fetch('/api/config');
+  return res.json();
+}
+```
+
+`wsUrl()` is called **before every connection attempt**. The previous ticket was consumed, and even an unused one would have expired during a long backoff. An `AuthError` (HTTP 401 from `/api/ticket`, which means the JWT expired) is marked `fatal`, so the socket stops retrying and the app returns to the login screen.
+
+### `ws-client.js`: the resilient socket
+
+This class applies Chapters 4 and 5. It runs unchanged in the browser **and in Node 22+** (which has a global `WebSocket`), so the integration tests use it too.
+
+**`project/public/src/ws-client.js`**
+
+```js
+// HuddleSocket — a resilient WebSocket client.
+//
+//  * reconnects forever with exponential backoff + full jitter
+//  * fetches a fresh one-time ticket before every (re)connect
+//  * request(type, payload) -> Promise resolved by the matching `replyTo`
+//  * queues requests while offline, rejects them on timeout
+//  * app-level ping detects dead connections the browser hasn't noticed
+//  * emits 'open' with { reconnected } so the app can resync
+//
+// Events (EventTarget): state, open, close, message, reconnecting, fatal,
+// latency, and one event per server message type (e.g. 'chat:message').
+
+export class RequestError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
+
+export class HuddleSocket extends EventTarget {
+  #ws = null;
+  #pending = new Map(); // id -> { resolve, reject, timer, frame }
+  #outbox = []; // frames waiting for an open socket
+  #attempt = 0;
+  #everOpened = false;
+  #stopped = false;
+  #reconnectTimer = null;
+  #pingTimer = null;
+
+  /**
+   * @param {object} opts
+   * @param {() => Promise<string>} opts.getUrl  resolves the ws:// URL (with a fresh ticket)
+   */
+  constructor({ getUrl, requestTimeoutMs = 10_000, baseDelayMs = 500, maxDelayMs = 15_000, pingIntervalMs = 15_000 }) {
+    super();
+    this.getUrl = getUrl;
+    this.requestTimeoutMs = requestTimeoutMs;
+    this.baseDelayMs = baseDelayMs;
+    this.maxDelayMs = maxDelayMs;
+    this.pingIntervalMs = pingIntervalMs;
+    this.state = 'idle';
+
+    // Networks come back before backoff timers fire; skip the wait.
+    globalThis.addEventListener?.('online', () => this.reconnectNow());
+    globalThis.document?.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') this.reconnectNow();
+    });
+  }
+
+  // ---- public API ---------------------------------------------------------
+
+  connect() {
+    this.#stopped = false;
+    if (this.state === 'idle' || this.state === 'closed') this.#open();
+    return this;
+  }
+
+  close() {
+    this.#stopped = true;
+    clearTimeout(this.#reconnectTimer);
+    this.#stopPing();
+    this.#ws?.close(1000, 'bye');
+    this.#failPending('closed', 'Socket closed');
+    this.#setState('closed');
+  }
+
+  /** Skip the backoff delay (e.g. user clicked "Retry now"). */
+  reconnectNow() {
+    if (this.#stopped || this.state !== 'reconnecting') return;
+    clearTimeout(this.#reconnectTimer);
+    this.#open();
+  }
+
+  /** Send a request and await its reply. Rejects with RequestError. */
+  request(type, payload = {}, { timeoutMs = this.requestTimeoutMs } = {}) {
+    const frame = { type, id: uid(), payload };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(frame.id);
+        this.#outbox = this.#outbox.filter((f) => f !== frame);
+        reject(new RequestError('timeout', `${type} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.#pending.set(frame.id, { resolve, reject, timer, type });
+      this.#send(frame);
+    });
+  }
+
+  /** Fire-and-forget. Dropped (not queued) when offline — for ephemeral stuff like typing. */
+  notify(type, payload = {}) {
+    if (this.state !== 'open') return false;
+    this.#ws.send(JSON.stringify({ type, id: uid(), payload }));
+    return true;
+  }
+
+  /** Subscribe to a server event type. Returns an unsubscribe function. */
+  on(type, fn) {
+    const listener = (e) => fn(e.detail);
+    this.addEventListener(type, listener);
+    return () => this.removeEventListener(type, listener);
+  }
+
+  // ---- internals ------------------------------------------------------------
+
+  #emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  #setState(state) {
+    if (this.state === state) return;
+    this.state = state;
+    this.#emit('state', { state });
+  }
+
+  #send(frame) {
+    if (this.state === 'open' && this.#ws?.readyState === WebSocket.OPEN) this.#ws.send(JSON.stringify(frame));
+    else this.#outbox.push(frame);
+  }
+
+  async #open() {
+    this.#setState(this.#everOpened ? 'reconnecting' : 'connecting');
+    let url;
+    try {
+      url = await this.getUrl(); // fresh one-time ticket every attempt
+    } catch (err) {
+      if (err.fatal) {
+        // e.g. JWT expired: backoff won't fix it, the app must log in again
+        this.#stopped = true;
+        this.#setState('closed');
+        return this.#emit('fatal', { error: err });
+      }
+      return this.#scheduleReconnect();
+    }
+    if (this.#stopped) return;
+
+    const ws = new WebSocket(url);
+    this.#ws = ws;
+
+    ws.onopen = () => {
+      const reconnected = this.#everOpened;
+      this.#everOpened = true;
+      this.#attempt = 0;
+      this.#setState('open');
+      const queued = this.#outbox;
+      this.#outbox = [];
+      for (const f of queued) ws.send(JSON.stringify(f));
+      this.#startPing();
+      this.#emit('open', { reconnected });
+    };
+
+    ws.onmessage = (e) => {
+      let msg;
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      if (msg.replyTo && this.#pending.has(msg.replyTo)) {
+        const p = this.#pending.get(msg.replyTo);
+        this.#pending.delete(msg.replyTo);
+        clearTimeout(p.timer);
+        if (msg.type === 'error') p.reject(new RequestError(msg.payload.code, msg.payload.message));
+        else p.resolve(msg.payload);
+        return;
+      }
+      if (msg.type === 'error') return this.#emit('servererror', msg.payload);
+      this.#emit('message', msg);
+      this.#emit(msg.type, msg.payload);
+    };
+
+    ws.onclose = (e) => this.#handleClose(ws, e.code, e.reason);
+    ws.onerror = () => {}; // 'close' always follows; handle there
+  }
+
+  #handleClose(ws, code, reason) {
+    if (ws !== this.#ws) return; // stale socket
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    this.#ws = null;
+    this.#stopPing();
+    // In-flight requests went out on a dead socket and will never be answered.
+    this.#failPending('disconnected', 'Connection lost');
+    this.#emit('close', { code, reason });
+    if (this.#stopped) return this.#setState('closed');
+    this.#scheduleReconnect();
+  }
+
+  #scheduleReconnect() {
+    // Full jitter: random delay in [0, min(max, base * 2^attempt)].
+    // Spreads a thundering herd of clients after a server restart.
+    const ceiling = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** this.#attempt);
+    const delay = Math.round(Math.random() * ceiling);
+    this.#attempt++;
+    this.#setState('reconnecting');
+    this.#emit('reconnecting', { attempt: this.#attempt, delay, at: Date.now() + delay });
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = setTimeout(() => this.#open(), delay);
+    this.#reconnectTimer.unref?.(); // Node (tests/CLI): don't keep the process alive
+  }
+
+  #failPending(code, message) {
+    for (const [id, p] of this.#pending) {
+      clearTimeout(p.timer);
+      p.reject(new RequestError(code, message));
+      this.#pending.delete(id);
+    }
+  }
+
+  #startPing() {
+    this.#stopPing();
+    const ping = async () => {
+      const ws = this.#ws;
+      const t = performance.now();
+      try {
+        await this.request('sys:ping', { t: Date.now() }, { timeoutMs: 5000 });
+        this.#emit('latency', { ms: Math.round(performance.now() - t) });
+      } catch (err) {
+        // Half-open TCP: the browser still says OPEN but nothing gets through.
+        if (err.code === 'timeout' && ws && ws === this.#ws) {
+          ws.close(4000, 'ping timeout');
+          this.#handleClose(ws, 4000, 'ping timeout');
+        }
+      }
+    };
+    ping();
+    this.#pingTimer = setInterval(ping, this.pingIntervalMs);
+    this.#pingTimer.unref?.();
+  }
+
+  #stopPing() {
+    clearInterval(this.#pingTimer);
+  }
+}
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> connecting: connect()
+  connecting --> open: onopen (attempt=0, flush outbox, start ping)
+  connecting --> reconnecting: ticket fetch failed / socket closed
+  open --> reconnecting: onclose / ping timeout (half-open)
+  reconnecting --> connecting: after random(0, min(15s, 0.5s·2^n))
+  reconnecting --> connecting: reconnectNow() on online event, tab visible, Retry button
+  connecting --> closed: AuthError (fatal)
+  open --> closed: close()
+```
+
+Why each piece exists:
+
+- **Full jitter** (`random(0, ceiling)`). When a server restarts, 10,000 tabs reconnect. Plain exponential backoff has them retry in synchronized waves. Full jitter spreads them evenly.
+- **In-flight requests reject with `disconnected`** when the socket closes. Their replies will never arrive, and a stuck spinner is worse than an error.
+- **The outbox** queues *requests* made while connecting, and they're flushed on open. **Notifications are dropped** instead: typing from 20 seconds ago is noise.
+- **App-level ping.** Browsers can't see WebSocket ping frames and may report `OPEN` for minutes on a dead Wi-Fi link. A `sys:ping` request that times out after 5 s forces a reconnect. The round-trip time also feeds the latency readout in the sidebar.
+- **`unref?.()`** on timers is a no-op in browsers, and in Node it keeps a test process from hanging on a reconnect loop.
+
+### `main.js`: reconnect, resync, optimistic UI
+
+`main.js` (about 700 lines) is the glue: one `state` object, render functions, and DOM wiring. The full file is in the project. These are the parts that matter for real-time correctness.
+
+**Every connection starts with a welcome.** On the first one we do the initial load. On later ones we resync:
+
+*from `project/public/src/main.js`*
+
+```js
+// Every connection starts with a welcome. First one: initial load.
+// Later ones: we reconnected, so catch up on what we missed.
+socket.on('session:welcome', (w) => {
+  const restarted = state.epoch !== null && state.epoch !== w.epoch;
+  state.epoch = w.epoch;
+  state.clientId = w.clientId;
+  applySnapshot(w);
+  if (!state.initialised) {
+    state.initialised = true;
+    initialJoin();
+  } else {
+    resync({ restarted });
+  }
+});
+```
+
+**Resync:** one request normally, or a full refetch if the server restarted (the epoch changed):
+
+*from `project/public/src/main.js`*
+
+```js
+/**
+ * After a reconnect: ONE request returns a fresh snapshot plus every message
+ * we missed (seq > lastSeq) in each channel. Then flush the outbox (same
+ * clientMsgId, so the server de-duplicates anything that did get through)
+ * and rejoin the huddle if we were in one.
+ */
+async function resync({ restarted = false } = {}) {
+  try {
+    if (restarted) {
+      // The server lost its memory: our seq cursors point at nothing. Start
+      // over. (Unsent messages survive in the outbox and are re-sent below.)
+      for (const ch of state.channels.values()) Object.assign(ch, { messages: [], lastSeq: 0, joined: false });
+      await Promise.allSettled([...state.channels.keys()].map((id) => joinChannel(id)));
+    } else {
+      const cursors = {};
+      for (const [id, ch] of state.channels) if (ch.joined) cursors[id] = ch.lastSeq;
+      const res = await socket.request('sys:resync', { channels: cursors });
+      applySnapshot(res);
+      for (const [channelId, r] of Object.entries(res.missed)) {
+        for (const m of r.messages) addMessage(m, null, { silent: channelId === state.active });
+        state.channels.get(channelId).typing = r.typing.filter((u) => u.id !== state.session.user.id);
+      }
+      for (const [id, ch] of state.channels) if (!ch.joined) joinChannel(id).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('resync failed', err);
+    return;
+  }
+  for (const [clientMsgId, { channelId, text }] of state.outbox) sendMessage(channelId, text, clientMsgId);
+  if (state.rejoinHuddle) {
+    const roomId = state.rejoinHuddle;
+    state.rejoinHuddle = null;
+    joinHuddle(roomId);
+  }
+  renderMessages({ keepScroll: true });
+}
+```
+
+**Optimistic send with an idempotency key.** The message appears immediately as *sending…*. While offline it stays in `state.outbox`, which is replayed at the end of `resync()` **after** the channels are re-joined. If it were queued in the transport outbox instead, it would be flushed on `open`, *before* the re-join, and fail with `not_member`:
+
+*from `project/public/src/main.js`*
+
+```js
+async function sendMessage(channelId, text, clientMsgId = uid()) {
+  const ch = state.channels.get(channelId);
+  state.outbox.set(clientMsgId, { channelId, text });
+  let pending = ch.messages.find((m) => m.clientMsgId === clientMsgId);
+  if (!pending) {
+    pending = { id: clientMsgId, clientMsgId, pending: true, user: state.session.user, text, ts: Date.now(), reactions: {} };
+    ch.messages.push(pending);
+  }
+  pending.failed = false;
+  if (channelId === state.active) renderMessages({ animateId: pending.id });
+  // Offline: don't let the transport queue it — it would be flushed before we
+  // re-join channels. The outbox is replayed at the end of resync().
+  if (socket.state !== 'open') return;
+
+  try {
+    const { message } = await socket.request('chat:send', { channelId, text, clientMsgId });
+    addMessage(message, clientMsgId);
+  } catch (err) {
+    if (err.code === 'disconnected' || err.code === 'timeout') return; // stays in outbox, retried on resync
+    state.outbox.delete(clientMsgId);
+    pending.failed = true;
+    toast(`Message not sent: ${err.message}`, 'error');
+    if (channelId === state.active) renderMessages({ keepScroll: true });
+  }
+}
+```
+
+*from `project/public/src/main.js`*
+
+```js
+function addMessage(message, clientMsgId, { silent = false } = {}) {
+  const ch = state.channels.get(message.channelId);
+  if (!ch) return;
+  ch.lastSeq = Math.max(ch.lastSeq, message.seq);
+  if (clientMsgId) {
+    state.outbox.delete(clientMsgId);
+    const i = ch.messages.findIndex((m) => m.clientMsgId === clientMsgId);
+    if (i >= 0) {
+      ch.messages[i] = message; // optimistic -> confirmed
+      if (message.channelId === state.active) renderMessages({ keepScroll: true });
+      return;
+    }
+  }
+  if (ch.messages.some((m) => m.id === message.id)) return;
+  ch.messages.push(message);
+  ch.messages.sort((a, b) => (a.seq ?? Infinity) - (b.seq ?? Infinity));
+  const mine = message.user.id === state.session.user.id;
+  if (message.channelId !== state.active || document.hidden) {
+    if (!mine) ch.unread++;
+    renderChannels();
+    renderTitle();
+  }
+  if (message.channelId === state.active && !silent) renderMessages({ animateId: message.id });
+}
+```
+
+**Rendering is XSS-safe by construction.** All user text goes through `escapeHtml` *before* the mini-markdown regexes run, and only `http(s)` links become anchors:
+
+*from `project/public/src/dom.js`*
+
+```js
+/** Tiny, safe markdown: escape first, then `code`, **bold**, _italic_, links. */
+export function renderText(text) {
+  let html = escapeHtml(text);
+  const codes = [];
+  html = html.replace(/```([\s\S]+?)```/g, (_, c) => `\u0000${codes.push(`<pre><code>${c.replace(/^\n/, '')}</code></pre>`) - 1}\u0000`);
+  html = html.replace(/`([^`\n]+)`/g, (_, c) => `\u0000${codes.push(`<code>${c}</code>`) - 1}\u0000`);
+  html = html
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|\s)_([^_\n]+)_(?=\s|$)/g, '$1<em>$2</em>')
+    .replace(/\bhttps?:\/\/[^\s<]+[^\s<.,:;"')\]]/g, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`)
+    .replace(/\n/g, '<br>');
+  return html.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[+i]);
+}
+```
+
+### ✅ Checkpoint: run this and you should see…
+
+**In Node first.** `HuddleSocket` uses only web-standard APIs, so it runs in Node 22+. Add static files and `/api/config` to the harness (media is still off):
+
+**`scratch/m6-web.mjs`** *(throwaway harness, not part of Huddle)*
+
+```js
+// Throwaway harness for M6: the M5 harness plus the static client and
+// /api/config, so the real browser UI can talk to it (media still off).
+import http from 'node:http';
+import express from 'express';
+import { loadConfig } from '../src/config.js';
+import { createAuth } from '../src/auth.js';
+import { Hub } from '../src/ws/hub.js';
+import { MessageRouter } from '../src/ws/router.js';
+import { createGateway } from '../src/ws/gateway.js';
+import { registerChat } from '../src/chat/handlers.js';
+
+const config = loadConfig();
+const app = express();
+const server = http.createServer(app);
+const auth = createAuth(config);
+const hub = new Hub();
+const router = new MessageRouter();
+const metrics = { countIn() {}, countOut() {}, countRejected() {} };
+
+app.use(express.json({ limit: '8kb' }));
+app.use('/api', auth.router);
+app.get('/api/config', (req, res) => res.json({ media: false, wsPath: config.ws.path }));
+app.use(express.static(new URL('../public', import.meta.url).pathname, { extensions: ['html'] }));
+registerChat({ router, hub, config });
+
+createGateway({ server, config, tickets: auth.tickets, router, hub, metrics });
+server.listen(3001, () => console.log('M6 web harness on http://localhost:3001'));
+```
+
+**`scratch/socket-probe.mjs`** *(throwaway probe client)*
+
+```js
+// Drive the real browser class, HuddleSocket, from Node (22+ has a global WebSocket).
+// Leave it running, then stop and restart the harness in the other terminal.
+import { HuddleSocket } from '../public/src/ws-client.js';
+
+const base = 'http://localhost:3001';
+const post = (path, token) =>
+  fetch(base + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token && { authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(path === '/api/login' ? { nickname: 'probe' } : {}),
+  }).then((r) => r.json());
+
+const { token } = await post('/api/login');
+const sock = new HuddleSocket({ getUrl: async () => `ws://localhost:3001/ws?ticket=${(await post('/api/ticket', token)).ticket}` });
+sock.on('state', ({ state }) => console.log('state     ', state));
+sock.on('reconnecting', ({ attempt, delay }) => console.log('retry     ', { attempt, delay }));
+sock.on('open', ({ reconnected }) => console.log('open      ', { reconnected }));
+sock.on('session:welcome', ({ epoch, clientId }) => console.log('welcome   ', { epoch, clientId }));
+sock.on('latency', ({ ms }) => console.log('latency   ', ms, 'ms'));
+sock.connect();
+// HuddleSocket unref()s its timers so tests can exit; keep this script alive on purpose.
+setInterval(() => {}, 60_000);
+```
+
+```bash
+# Terminal A
+node scratch/m6-web.mjs
+
+# Terminal B
+node scratch/socket-probe.mjs
+# now press Ctrl+C in Terminal A, wait a few seconds, and start it again
+```
+
+You should see the full reconnect cycle, with random (jittered) delays under a growing ceiling, and a **different epoch** after the restart. That epoch change is what makes `main.js` throw away its `seq` cursors and refetch:
+
+```
+state      connecting
+state      open
+open       { reconnected: false }
+welcome    { epoch: '93437d9c', clientId: 'c_ae67036b' }
+latency    2 ms
+state      reconnecting
+retry      { attempt: 1, delay: 467 }
+retry      { attempt: 2, delay: 432 }
+retry      { attempt: 3, delay: 208 }
+retry      { attempt: 4, delay: 1631 }
+state      open
+open       { reconnected: true }
+welcome    { epoch: 'ce3d0c11', clientId: 'c_e9137c51' }
+```
+
+**Then in the browser.** `main.js` touches the DOM, so it can't run in Node; `for f in public/src/*.js; do node --check "$f"; done` at least catches syntax errors (no output means none). It is bundled with esbuild, and it also imports `media-client.js` and `huddle-view.js`, which you write in M9. In a build-along, copy those two files from `project/public/src/` now and revisit them later.
+
+```bash
+npm run build            # → public/bundle.js
+node scratch/m6-web.mjs  # then open http://localhost:3001 in two windows (one private)
+```
+
+Log in as two users and chat. Then stop the harness: both windows show the reconnect banner with a countdown. Type a message in one window while the server is down (it shows *sending…*), restart the harness, and watch it arrive **once** in both windows. The session survives the restart because the dev JWT secret is a constant.
+
+**If it doesn't work**
+
+- *The probe exits right after the first `retry`*: `HuddleSocket` calls `unref()` on its timers so tests can exit. The probe's final `setInterval` line keeps the process alive; make sure you kept it.
+- *The browser is stuck on "Connecting…"*: open DevTools → Network. A `401` on `/api/ticket` means the JWT was signed by a different secret (you ran with `NODE_ENV=test` or changed `JWT_SECRET`), so log out and in again. A failed `ws://` request means you opened port 3000 instead of 3001.
+- *`npm run build` says `Could not resolve "./media-client.js"`*: see the note above; copy the M9 files in first.
+
+---
+
+## 13.9 M7 — mediasoup worker pool, Room and Peer
+
+**Goal:** the server-side media objects, without any signaling yet: a pool of mediasoup workers that survives a crash, a `Room` (one Router per huddle) with active-speaker detection, and a `Peer` that owns everything one connection creates.
+
+**Files you'll write:** `project/src/media/codecs.js`, `project/src/media/workerPool.js`, `project/src/media/Peer.js`, `project/src/media/Room.js`.
 
 Chapter 11 built a minimal SFU. Huddle turns it into something that holds up in production: multiple workers, rooms created on demand, crash recovery, mute, screen share and active speaker.
 
@@ -1624,6 +2641,70 @@ export class Room extends EventEmitter {
 ```
 
 The active-speaker logic is deliberately simple. `maxEntries: 1` gives the loudest producer above −65 dBov every 700 ms. We broadcast only when the speaker **changes**, and `silence` clears it. `producer.appData.peerId` (set in `media:produce`) maps a producer back to a person.
+
+### ✅ Checkpoint: run this and you should see…
+
+Start two real workers, put a Room on one of them, then `SIGKILL` that worker and watch the pool recover:
+
+**`scratch/m7-workers.mjs`** *(throwaway harness, not part of Huddle)*
+
+```js
+// Throwaway harness for M7: start real mediasoup workers, put a Room on one,
+// then SIGKILL that worker and watch the pool notice and respawn it.
+import * as mediasoup from 'mediasoup';
+import { WorkerPool } from '../src/media/workerPool.js';
+import { Room } from '../src/media/Room.js';
+
+const pool = new WorkerPool(mediasoup, { numWorkers: 2, logLevel: 'warn' });
+await pool.start();
+console.log('workers:', pool.size, (await pool.stats()).map((w) => w.pid));
+
+const room = await Room.create({ id: 'general', worker: pool.next() });
+room.on('close', () => console.log('room closed'));
+console.log('router codecs:', room.rtpCapabilities.codecs.map((c) => c.mimeType).join(', '));
+
+pool.on('workerDied', (w) => {
+  console.log('workerDied pid', w.pid, '-> pool size now', pool.size);
+  if (room.worker === w) room.close('worker_died'); // what MediaService does in M8
+});
+process.kill(room.worker.pid, 'SIGKILL');
+
+setTimeout(async () => {
+  console.log('after respawn:', pool.size, (await pool.stats()).map((w) => w.pid));
+  pool.close();
+}, 1500);
+```
+
+```bash
+node -e "import('mediasoup').then((m) => console.log(m.version, m.workerBin))"   # the worker binary exists
+LOG_LEVEL=silent node scratch/m7-workers.mjs
+```
+
+You should see (PIDs differ):
+
+```
+workers: 2 [ 58983, 58984 ]
+router codecs: audio/opus, video/VP8, video/rtx, video/H264, video/rtx
+workerDied pid 58983 -> pool size now 1
+room closed
+after respawn: 2 [ 58984, 58994 ]
+```
+
+Two things to notice: mediasoup adds an `rtx` (retransmission) codec for each video codec you configure, and the replacement worker has a new PID.
+
+**If it doesn't work**
+
+- *`spawn … mediasoup-worker ENOENT`*: the C++ worker was never downloaded or built. Re-run `npm install` in `project/` and check the path printed by the first command exists.
+- *`after respawn: 1`*: the respawn happens 1 s after the death. If you shortened the final timeout, the pool hasn't caught up yet.
+- *The process doesn't exit*: something still holds a worker. `pool.close()` must run; in the real server, `MediaService.close()` does it.
+
+---
+
+## 13.10 M8 — Media signaling handlers
+
+**Goal:** Huddle's own signaling protocol, as `media:*` handlers on the same router chat uses, plus a fallback so the server still runs (chat only) when mediasoup can't load.
+
+**Files you'll write:** `project/src/media/handlers.js`, `project/src/media/index.js`.
 
 ### The signaling handlers
 
@@ -1960,552 +3041,128 @@ export async function createMedia({ config, hub, router, validateRoom }) {
 }
 ```
 
----
+### ✅ Checkpoint: run this and you should see…
 
-## 13.11 Step 8 — Metrics and the composition root
+Add the media layer to the harness. It now mirrors `server.js` except for metrics and security headers:
 
-`GET /metrics` exposes what you would alert on (Chapter 12): connection count, message rates, rejections by reason (origin, ticket, rate, invalid), rooms, peers, and per-worker CPU and RSS.
-
-**`project/src/metrics.js`**
+**`scratch/m8-media.mjs`** *(throwaway harness, not part of Huddle)*
 
 ```js
-// In-process metrics. Rates use a 10-slot ring of per-second counters, so
-// "messages/sec" is a 10-second moving average, not a lifetime average.
-import express from 'express';
-
-class RateWindow {
-  #slots = new Array(10).fill(0);
-  #slotSecond = Math.floor(Date.now() / 1000);
-  total = 0;
-
-  #rotate() {
-    const now = Math.floor(Date.now() / 1000);
-    const steps = Math.min(now - this.#slotSecond, this.#slots.length);
-    for (let i = 0; i < steps; i++) {
-      this.#slots.shift();
-      this.#slots.push(0);
-    }
-    this.#slotSecond = now;
-  }
-
-  inc(n = 1) {
-    this.#rotate();
-    this.#slots[this.#slots.length - 1] += n;
-    this.total += n;
-  }
-
-  perSecond() {
-    this.#rotate();
-    // exclude the current (partial) second
-    const full = this.#slots.slice(0, -1);
-    return +(full.reduce((a, b) => a + b, 0) / full.length).toFixed(2);
-  }
-}
-
-export class Metrics {
-  startedAt = Date.now();
-  #in = new RateWindow();
-  #out = new RateWindow();
-  rejected = { origin: 0, ticket: 0, rate: 0, invalid: 0 };
-
-  countIn() {
-    this.#in.inc();
-  }
-  countOut() {
-    this.#out.inc();
-  }
-  countRejected(kind) {
-    this.rejected[kind] = (this.rejected[kind] ?? 0) + 1;
-  }
-
-  async snapshot({ hub, chat, media }) {
-    const mem = process.memoryUsage();
-    return {
-      uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
-      connections: hub.clients.size,
-      usersOnline: hub.users.length,
-      messages: {
-        inPerSec: this.#in.perSecond(),
-        outPerSec: this.#out.perSecond(),
-        inTotal: this.#in.total,
-        outTotal: this.#out.total,
-      },
-      rejected: this.rejected,
-      channels: chat.channels.list().length,
-      media: { available: media.available, ...media.stats(), workerDetails: await media.workerStats() },
-      memory: { rssMb: +(mem.rss / 1048576).toFixed(1), heapUsedMb: +(mem.heapUsed / 1048576).toFixed(1) },
-    };
-  }
-}
-
-/** GET /metrics (JSON) and GET /metrics?format=prometheus (text exposition). */
-export function metricsRouter(metrics, deps) {
-  const router = express.Router();
-  router.get('/', async (req, res) => {
-    const s = await metrics.snapshot(deps);
-    if (req.query.format !== 'prometheus') return res.json(s);
-    const lines = [
-      ['huddle_ws_connections', 'gauge', s.connections],
-      ['huddle_users_online', 'gauge', s.usersOnline],
-      ['huddle_ws_messages_in_total', 'counter', s.messages.inTotal],
-      ['huddle_ws_messages_out_total', 'counter', s.messages.outTotal],
-      ['huddle_media_rooms', 'gauge', s.media.rooms],
-      ['huddle_media_peers', 'gauge', s.media.peers],
-      ['huddle_media_workers', 'gauge', s.media.workers],
-    ].flatMap(([name, type, v]) => [`# TYPE ${name} ${type}`, `${name} ${v}`]);
-    for (const [kind, v] of Object.entries(s.rejected)) lines.push(`huddle_ws_rejected_total{reason="${kind}"} ${v}`);
-    res.type('text/plain; version=0.0.4').send(lines.join('\n') + '\n');
-  });
-  return router;
-}
-```
-
-The "messages/sec" value is a **10-second moving window**, not `total / uptime`, which would flatten every spike into nothing.
-
-`server.js` is the only file that creates things. Everything else receives its dependencies as arguments, which is why a test can start a full Huddle on port 0 with `createHuddleServer({ media: { enabled: false } })`:
-
-**`project/src/server.js`**
-
-```js
-// Composition root: builds every piece and wires them together. Nothing else
-// imports config or creates singletons, which is what makes it testable —
-// tests call createHuddleServer() with overrides and port 0.
+// Throwaway harness for M8/M9: the M6 harness plus the real media layer.
 import http from 'node:http';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { loadConfig } from './config.js';
-import { createAuth } from './auth.js';
-import { Hub } from './ws/hub.js';
-import { MessageRouter } from './ws/router.js';
-import { createGateway } from './ws/gateway.js';
-import { registerChat } from './chat/handlers.js';
-import { createMedia } from './media/index.js';
-import { Metrics, metricsRouter } from './metrics.js';
-import { logger } from './logger.js';
+import { loadConfig } from '../src/config.js';
+import { createAuth } from '../src/auth.js';
+import { Hub } from '../src/ws/hub.js';
+import { MessageRouter } from '../src/ws/router.js';
+import { createGateway } from '../src/ws/gateway.js';
+import { registerChat } from '../src/chat/handlers.js';
+import { createMedia } from '../src/media/index.js';
 
-const publicDir = fileURLToPath(new URL('../public', import.meta.url));
+const config = loadConfig();
+const app = express();
+const server = http.createServer(app);
+const auth = createAuth(config);
+const hub = new Hub();
+const router = new MessageRouter();
+const metrics = { countIn() {}, countOut() {}, countRejected() {} };
 
-export async function createHuddleServer(overrides = {}) {
-  const config = loadConfig(overrides);
-  const app = express();
-  const server = http.createServer(app);
-  const hub = new Hub();
-  const router = new MessageRouter();
-  const metrics = new Metrics();
-  const auth = createAuth(config);
+let media;
+const chat = registerChat({ router, hub, config, getHuddles: () => media?.huddles() ?? [] });
+media = await createMedia({ config, hub, router, validateRoom: (id) => chat.channels.get(id) });
 
-  // Media needs chat (to validate room ids) and chat needs media (to list
-  // huddles in the welcome snapshot) — break the cycle with a late-bound getter.
-  let media;
-  const chat = registerChat({ router, hub, config, getHuddles: () => media?.huddles() ?? [] });
-  media = await createMedia({ config, hub, router, validateRoom: (id) => chat.channels.get(id) });
+app.use(express.json({ limit: '8kb' }));
+app.use('/api', auth.router);
+app.get('/api/config', (req, res) => res.json({ media: media.available, wsPath: config.ws.path }));
+app.use(express.static(new URL('../public', import.meta.url).pathname, { extensions: ['html'] }));
 
-  app.disable('x-powered-by');
-  app.set('trust proxy', 'loopback');
-  app.use((req, res, next) => {
-    res.set({
-      'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
-      'Content-Security-Policy':
-        "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
-    });
-    next();
-  });
-  app.use(express.json({ limit: '8kb' }));
-  app.use('/api', auth.router);
-  app.get('/api/config', (req, res) => res.json({ media: media.available, wsPath: config.ws.path }));
-  app.get('/healthz', (req, res) => res.json({ ok: true }));
-  app.use('/metrics', metricsRouter(metrics, { hub, chat, media }));
-  app.use(express.static(publicDir, { extensions: ['html'] }));
-
-  const gateway = createGateway({ server, config, tickets: auth.tickets, router, hub, metrics });
-
-  return {
-    app,
-    server,
-    config,
-    hub,
-    chat,
-    media,
-    auth,
-    listen(port = config.port, host = config.host) {
-      return new Promise((resolve) => server.listen(port, host, () => resolve(server.address())));
-    },
-    async close() {
-      gateway.close();
-      media.close();
-      auth.close();
-      server.closeAllConnections?.();
-      await new Promise((resolve) => server.close(resolve));
-    },
-  };
-}
-
-// Run directly: `node src/server.js`
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const huddle = await createHuddleServer();
-  const addr = await huddle.listen();
-  logger.info(`Huddle listening on http://localhost:${addr.port}`, {
-    media: huddle.media.available,
-    announcedIp: huddle.config.media.announcedIp,
-    rtcPorts: `${huddle.config.media.rtcMinPort}-${huddle.config.media.rtcMaxPort}`,
-  });
-
-  let stopping = false;
-  const shutdown = async (signal) => {
-    if (stopping) return;
-    stopping = true;
-    logger.info('shutting down', { signal });
-    const force = setTimeout(() => process.exit(1), 5000).unref();
-    await huddle.close();
-    clearTimeout(force);
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-}
+createGateway({ server, config, tickets: auth.tickets, router, hub, metrics });
+server.listen(3001, () => console.log('M8 media harness on http://localhost:3001', { media: media.available }));
 ```
 
-- **Chat and media depend on each other**: media validates room ids against channels, and the chat welcome lists huddles. A late-bound getter (`() => media?.huddles()`) breaks the cycle without a global.
-- **Shutdown order:** close all sockets with **1001 Going Away** (clients reconnect with backoff, ideally to another instance behind the load balancer), close media, then stop the HTTP server. A 5 s watchdog forces exit if something hangs.
-- **Security headers** include a CSP that allows `ws:`/`wss:` for `connect-src` and `blob:` for media. `frame-ancestors 'none'` blocks clickjacking.
+A raw client can't produce real media (that needs `mediasoup-client`, M9), but it can walk the first steps of the protocol and check the error paths:
 
-Try it:
+**`scratch/media-probe.mjs`** *(throwaway probe client)*
+
+```js
+// Walk the first steps of the signaling protocol with raw requests.
+const base = 'http://localhost:3001';
+const post = (path, body, token) =>
+  fetch(base + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token && { authorization: `Bearer ${token}` }) },
+    body: JSON.stringify(body ?? {}),
+  }).then((r) => r.json());
+
+const { token } = await post('/api/login', { nickname: 'probe' });
+const { ticket } = await post('/api/ticket', {}, token);
+const ws = new WebSocket(`ws://localhost:3001/ws?ticket=${ticket}`);
+const pending = new Map();
+ws.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  if (m.replyTo) pending.get(m.replyTo)?.(m);
+};
+await new Promise((r) => (ws.onopen = r));
+const request = (type, payload = {}) =>
+  new Promise((resolve) => {
+    const id = crypto.randomUUID();
+    pending.set(id, resolve);
+    ws.send(JSON.stringify({ type, id, payload }));
+  });
+const show = (label, m) => console.log(label.padEnd(26), m.type, m.type === 'error' ? m.payload.code : '');
+
+const caps = await request('media:getRouterRtpCapabilities', { roomId: 'general' });
+show('getRouterRtpCapabilities', caps);
+if (caps.type === 'ok') {
+  console.log('  codecs:', caps.payload.rtpCapabilities.codecs.map((c) => c.mimeType).join(', '));
+  show('createTransport (no join)', await request('media:createTransport', { direction: 'send' }));
+  show('join #nope', await request('media:join', { roomId: 'nope', rtpCapabilities: caps.payload.rtpCapabilities }));
+  // A real client sends device.rtpCapabilities; the router's are close enough for a smoke test.
+  show('join #general', await request('media:join', { roomId: 'general', rtpCapabilities: caps.payload.rtpCapabilities }));
+  const t = await request('media:createTransport', { direction: 'send' });
+  show('createTransport send', t);
+  console.log('  ICE candidates:', t.payload.iceCandidates.map((c) => `${c.protocol} ${c.address}:${c.port}`).join(', '));
+  show('leave', await request('media:leave'));
+}
+ws.close();
+```
 
 ```bash
-npm start &
-curl -s localhost:3000/metrics | jq .
-curl -s -XPOST localhost:3000/api/login -H 'content-type: application/json' -d '{"nickname":"ada"}'
-curl -si 'localhost:3000/ws?ticket=nope' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' | head -1
-# HTTP/1.1 401 Unauthorized
+# Terminal A
+LOG_LEVEL=warn node scratch/m8-media.mjs
+
+# Terminal B
+node scratch/media-probe.mjs
 ```
+
+You should see:
+
+```
+getRouterRtpCapabilities   ok
+  codecs: audio/opus, video/VP8, video/rtx, video/H264, video/rtx
+createTransport (no join)  error not_in_room
+join #nope                 error not_found
+join #general              ok
+createTransport send       ok
+  ICE candidates: udp 192.168.1.68:40016, tcp 192.168.1.68:40037
+leave                      ok
+```
+
+Look at the ICE candidates: they carry `announcedIp`, not `0.0.0.0`. This is the address browsers will send media to. Now stop Terminal A and restart it as `MEDIA_ENABLED=false LOG_LEVEL=warn node scratch/m8-media.mjs`. The same probe prints `getRouterRtpCapabilities   error media_unavailable`, and chat keeps working.
+
+**If it doesn't work**
+
+- *`media_unavailable` even though you wanted media*: look for `mediasoup unavailable, huddles disabled` in Terminal A. The `err` next to it says why (usually the worker binary, see M7).
+- *`EADDRINUSE`, or `error internal` with `WorkerClosedError`*: an older harness is still alive. mediasoup installs its own `SIGTERM` handler, so `kill <pid>` closes the workers but leaves the process listening on 3001. Stop harnesses with `Ctrl+C` (SIGINT), and use `lsof -i :3001` to find a stray one.
+- *ICE candidates show an IP other devices can't reach*: set `MEDIASOUP_ANNOUNCED_IP` to the LAN or public IP. Signaling will succeed either way; only media fails, so this check is worth doing now.
 
 ---
 
-## 13.12 Step 9 — The browser client
+## 13.11 M9 — Video UI
 
-### `api.js`: login and tickets
+**Goal:** the browser half of the signaling dance (`HuddleMedia` on `mediasoup-client`), the "Start huddle" flow in `main.js`, and a video grid that shows who is talking.
 
-**`project/public/src/api.js`**
-
-```js
-// HTTP side of auth. The JWT lives in sessionStorage (per tab) and is only
-// ever sent in an Authorization header — never in a WebSocket URL.
-const KEY = 'huddle.session';
-
-export class AuthError extends Error {
-  fatal = true;
-}
-
-export function loadSession() {
-  try {
-    return JSON.parse(sessionStorage.getItem(KEY));
-  } catch {
-    return null;
-  }
-}
-
-export function saveSession(session) {
-  try {
-    if (session) sessionStorage.setItem(KEY, JSON.stringify(session));
-    else sessionStorage.removeItem(KEY);
-  } catch {
-    /* private mode: session lives in memory only */
-  }
-}
-
-async function post(path, body, token) {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token && { Authorization: `Bearer ${token}` }) },
-    body: JSON.stringify(body ?? {}),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 401) throw new AuthError(data.error ?? 'unauthorized');
-  if (!res.ok) throw new Error(data.message ?? data.error ?? `HTTP ${res.status}`);
-  return data;
-}
-
-export const login = (nickname) => post('/api/login', { nickname });
-
-/** Build the WebSocket URL with a fresh one-time ticket. */
-export async function wsUrl(token, path = '/ws') {
-  const { ticket } = await post('/api/ticket', {}, token);
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}${path}?ticket=${encodeURIComponent(ticket)}`;
-}
-
-export async function serverConfig() {
-  const res = await fetch('/api/config');
-  return res.json();
-}
-```
-
-`wsUrl()` is called **before every connection attempt**. The previous ticket was consumed, and even an unused one would have expired during a long backoff. An `AuthError` (HTTP 401 from `/api/ticket`, which means the JWT expired) is marked `fatal`, so the socket stops retrying and the app returns to the login screen.
-
-### `ws-client.js`: the resilient socket
-
-This class applies Chapters 4 and 5. It runs unchanged in the browser **and in Node 22+** (which has a global `WebSocket`), so the integration tests use it too.
-
-**`project/public/src/ws-client.js`**
-
-```js
-// HuddleSocket — a resilient WebSocket client.
-//
-//  * reconnects forever with exponential backoff + full jitter
-//  * fetches a fresh one-time ticket before every (re)connect
-//  * request(type, payload) -> Promise resolved by the matching `replyTo`
-//  * queues requests while offline, rejects them on timeout
-//  * app-level ping detects dead connections the browser hasn't noticed
-//  * emits 'open' with { reconnected } so the app can resync
-//
-// Events (EventTarget): state, open, close, message, reconnecting, fatal,
-// latency, and one event per server message type (e.g. 'chat:message').
-
-export class RequestError extends Error {
-  constructor(code, message) {
-    super(message);
-    this.code = code;
-  }
-}
-
-const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
-
-export class HuddleSocket extends EventTarget {
-  #ws = null;
-  #pending = new Map(); // id -> { resolve, reject, timer, frame }
-  #outbox = []; // frames waiting for an open socket
-  #attempt = 0;
-  #everOpened = false;
-  #stopped = false;
-  #reconnectTimer = null;
-  #pingTimer = null;
-
-  /**
-   * @param {object} opts
-   * @param {() => Promise<string>} opts.getUrl  resolves the ws:// URL (with a fresh ticket)
-   */
-  constructor({ getUrl, requestTimeoutMs = 10_000, baseDelayMs = 500, maxDelayMs = 15_000, pingIntervalMs = 15_000 }) {
-    super();
-    this.getUrl = getUrl;
-    this.requestTimeoutMs = requestTimeoutMs;
-    this.baseDelayMs = baseDelayMs;
-    this.maxDelayMs = maxDelayMs;
-    this.pingIntervalMs = pingIntervalMs;
-    this.state = 'idle';
-
-    // Networks come back before backoff timers fire; skip the wait.
-    globalThis.addEventListener?.('online', () => this.reconnectNow());
-    globalThis.document?.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') this.reconnectNow();
-    });
-  }
-
-  // ---- public API ---------------------------------------------------------
-
-  connect() {
-    this.#stopped = false;
-    if (this.state === 'idle' || this.state === 'closed') this.#open();
-    return this;
-  }
-
-  close() {
-    this.#stopped = true;
-    clearTimeout(this.#reconnectTimer);
-    this.#stopPing();
-    this.#ws?.close(1000, 'bye');
-    this.#failPending('closed', 'Socket closed');
-    this.#setState('closed');
-  }
-
-  /** Skip the backoff delay (e.g. user clicked "Retry now"). */
-  reconnectNow() {
-    if (this.#stopped || this.state !== 'reconnecting') return;
-    clearTimeout(this.#reconnectTimer);
-    this.#open();
-  }
-
-  /** Send a request and await its reply. Rejects with RequestError. */
-  request(type, payload = {}, { timeoutMs = this.requestTimeoutMs } = {}) {
-    const frame = { type, id: uid(), payload };
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#pending.delete(frame.id);
-        this.#outbox = this.#outbox.filter((f) => f !== frame);
-        reject(new RequestError('timeout', `${type} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.#pending.set(frame.id, { resolve, reject, timer, type });
-      this.#send(frame);
-    });
-  }
-
-  /** Fire-and-forget. Dropped (not queued) when offline — for ephemeral stuff like typing. */
-  notify(type, payload = {}) {
-    if (this.state !== 'open') return false;
-    this.#ws.send(JSON.stringify({ type, id: uid(), payload }));
-    return true;
-  }
-
-  /** Subscribe to a server event type. Returns an unsubscribe function. */
-  on(type, fn) {
-    const listener = (e) => fn(e.detail);
-    this.addEventListener(type, listener);
-    return () => this.removeEventListener(type, listener);
-  }
-
-  // ---- internals ------------------------------------------------------------
-
-  #emit(type, detail) {
-    this.dispatchEvent(new CustomEvent(type, { detail }));
-  }
-
-  #setState(state) {
-    if (this.state === state) return;
-    this.state = state;
-    this.#emit('state', { state });
-  }
-
-  #send(frame) {
-    if (this.state === 'open' && this.#ws?.readyState === WebSocket.OPEN) this.#ws.send(JSON.stringify(frame));
-    else this.#outbox.push(frame);
-  }
-
-  async #open() {
-    this.#setState(this.#everOpened ? 'reconnecting' : 'connecting');
-    let url;
-    try {
-      url = await this.getUrl(); // fresh one-time ticket every attempt
-    } catch (err) {
-      if (err.fatal) {
-        // e.g. JWT expired: backoff won't fix it, the app must log in again
-        this.#stopped = true;
-        this.#setState('closed');
-        return this.#emit('fatal', { error: err });
-      }
-      return this.#scheduleReconnect();
-    }
-    if (this.#stopped) return;
-
-    const ws = new WebSocket(url);
-    this.#ws = ws;
-
-    ws.onopen = () => {
-      const reconnected = this.#everOpened;
-      this.#everOpened = true;
-      this.#attempt = 0;
-      this.#setState('open');
-      const queued = this.#outbox;
-      this.#outbox = [];
-      for (const f of queued) ws.send(JSON.stringify(f));
-      this.#startPing();
-      this.#emit('open', { reconnected });
-    };
-
-    ws.onmessage = (e) => {
-      let msg;
-      try {
-        msg = JSON.parse(e.data);
-      } catch {
-        return;
-      }
-      if (msg.replyTo && this.#pending.has(msg.replyTo)) {
-        const p = this.#pending.get(msg.replyTo);
-        this.#pending.delete(msg.replyTo);
-        clearTimeout(p.timer);
-        if (msg.type === 'error') p.reject(new RequestError(msg.payload.code, msg.payload.message));
-        else p.resolve(msg.payload);
-        return;
-      }
-      if (msg.type === 'error') return this.#emit('servererror', msg.payload);
-      this.#emit('message', msg);
-      this.#emit(msg.type, msg.payload);
-    };
-
-    ws.onclose = (e) => this.#handleClose(ws, e.code, e.reason);
-    ws.onerror = () => {}; // 'close' always follows; handle there
-  }
-
-  #handleClose(ws, code, reason) {
-    if (ws !== this.#ws) return; // stale socket
-    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
-    this.#ws = null;
-    this.#stopPing();
-    // In-flight requests went out on a dead socket and will never be answered.
-    this.#failPending('disconnected', 'Connection lost');
-    this.#emit('close', { code, reason });
-    if (this.#stopped) return this.#setState('closed');
-    this.#scheduleReconnect();
-  }
-
-  #scheduleReconnect() {
-    // Full jitter: random delay in [0, min(max, base * 2^attempt)].
-    // Spreads a thundering herd of clients after a server restart.
-    const ceiling = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** this.#attempt);
-    const delay = Math.round(Math.random() * ceiling);
-    this.#attempt++;
-    this.#setState('reconnecting');
-    this.#emit('reconnecting', { attempt: this.#attempt, delay, at: Date.now() + delay });
-    clearTimeout(this.#reconnectTimer);
-    this.#reconnectTimer = setTimeout(() => this.#open(), delay);
-    this.#reconnectTimer.unref?.(); // Node (tests/CLI): don't keep the process alive
-  }
-
-  #failPending(code, message) {
-    for (const [id, p] of this.#pending) {
-      clearTimeout(p.timer);
-      p.reject(new RequestError(code, message));
-      this.#pending.delete(id);
-    }
-  }
-
-  #startPing() {
-    this.#stopPing();
-    const ping = async () => {
-      const ws = this.#ws;
-      const t = performance.now();
-      try {
-        await this.request('sys:ping', { t: Date.now() }, { timeoutMs: 5000 });
-        this.#emit('latency', { ms: Math.round(performance.now() - t) });
-      } catch (err) {
-        // Half-open TCP: the browser still says OPEN but nothing gets through.
-        if (err.code === 'timeout' && ws && ws === this.#ws) {
-          ws.close(4000, 'ping timeout');
-          this.#handleClose(ws, 4000, 'ping timeout');
-        }
-      }
-    };
-    ping();
-    this.#pingTimer = setInterval(ping, this.pingIntervalMs);
-    this.#pingTimer.unref?.();
-  }
-
-  #stopPing() {
-    clearInterval(this.#pingTimer);
-  }
-}
-```
-
-```mermaid
-stateDiagram-v2
-  [*] --> connecting: connect()
-  connecting --> open: onopen (attempt=0, flush outbox, start ping)
-  connecting --> reconnecting: ticket fetch failed / socket closed
-  open --> reconnecting: onclose / ping timeout (half-open)
-  reconnecting --> connecting: after random(0, min(15s, 0.5s·2^n))
-  reconnecting --> connecting: reconnectNow() on online event, tab visible, Retry button
-  connecting --> closed: AuthError (fatal)
-  open --> closed: close()
-```
-
-Why each piece exists:
-
-- **Full jitter** (`random(0, ceiling)`). When a server restarts, 10,000 tabs reconnect. Plain exponential backoff has them retry in synchronized waves. Full jitter spreads them evenly.
-- **In-flight requests reject with `disconnected`** when the socket closes. Their replies will never arrive, and a stuck spinner is worse than an error.
-- **The outbox** queues *requests* made while connecting, and they're flushed on open. **Notifications are dropped** instead: typing from 20 seconds ago is noise.
-- **App-level ping.** Browsers can't see WebSocket ping frames and may report `OPEN` for minutes on a dead Wi-Fi link. A `sys:ping` request that times out after 5 s forces a reconnect. The round-trip time also feeds the latency readout in the sidebar.
-- **`unref?.()`** on timers is a no-op in browsers, and in Node it keeps a test process from hanging on a reconnect loop.
+**Files you'll write:** `project/public/src/media-client.js`, the huddle parts of `project/public/src/main.js`, `project/public/src/huddle-view.js`.
 
 ### `media-client.js`: mediasoup-client
 
@@ -2752,134 +3409,7 @@ export class HuddleMedia extends EventTarget {
 - **Simulcast for the camera** (3 layers). Screen share uses a single layer at a low frame rate, since text stays sharp at 15 fps.
 - **`createDevice` injection** lets tests build a `Device` on `FakeHandler`, so the whole class runs in Node.
 
-### `main.js`: reconnect, resync, optimistic UI
-
-`main.js` (about 700 lines) is the glue: one `state` object, render functions, and DOM wiring. The full file is in the project. These are the parts that matter for real-time correctness.
-
-**Every connection starts with a welcome.** On the first one we do the initial load. On later ones we resync:
-
-*from `project/public/src/main.js`*
-
-```js
-// Every connection starts with a welcome. First one: initial load.
-// Later ones: we reconnected, so catch up on what we missed.
-socket.on('session:welcome', (w) => {
-  const restarted = state.epoch !== null && state.epoch !== w.epoch;
-  state.epoch = w.epoch;
-  state.clientId = w.clientId;
-  applySnapshot(w);
-  if (!state.initialised) {
-    state.initialised = true;
-    initialJoin();
-  } else {
-    resync({ restarted });
-  }
-});
-```
-
-**Resync:** one request normally, or a full refetch if the server restarted (the epoch changed):
-
-*from `project/public/src/main.js`*
-
-```js
-/**
- * After a reconnect: ONE request returns a fresh snapshot plus every message
- * we missed (seq > lastSeq) in each channel. Then flush the outbox (same
- * clientMsgId, so the server de-duplicates anything that did get through)
- * and rejoin the huddle if we were in one.
- */
-async function resync({ restarted = false } = {}) {
-  try {
-    if (restarted) {
-      // The server lost its memory: our seq cursors point at nothing. Start
-      // over. (Unsent messages survive in the outbox and are re-sent below.)
-      for (const ch of state.channels.values()) Object.assign(ch, { messages: [], lastSeq: 0, joined: false });
-      await Promise.allSettled([...state.channels.keys()].map((id) => joinChannel(id)));
-    } else {
-      const cursors = {};
-      for (const [id, ch] of state.channels) if (ch.joined) cursors[id] = ch.lastSeq;
-      const res = await socket.request('sys:resync', { channels: cursors });
-      applySnapshot(res);
-      for (const [channelId, r] of Object.entries(res.missed)) {
-        for (const m of r.messages) addMessage(m, null, { silent: channelId === state.active });
-        state.channels.get(channelId).typing = r.typing.filter((u) => u.id !== state.session.user.id);
-      }
-      for (const [id, ch] of state.channels) if (!ch.joined) joinChannel(id).catch(() => {});
-    }
-  } catch (err) {
-    console.warn('resync failed', err);
-    return;
-  }
-  for (const [clientMsgId, { channelId, text }] of state.outbox) sendMessage(channelId, text, clientMsgId);
-  if (state.rejoinHuddle) {
-    const roomId = state.rejoinHuddle;
-    state.rejoinHuddle = null;
-    joinHuddle(roomId);
-  }
-  renderMessages({ keepScroll: true });
-}
-```
-
-**Optimistic send with an idempotency key.** The message appears immediately as *sending…*. While offline it stays in `state.outbox`, which is replayed at the end of `resync()` **after** the channels are re-joined. If it were queued in the transport outbox instead, it would be flushed on `open`, *before* the re-join, and fail with `not_member`:
-
-*from `project/public/src/main.js`*
-
-```js
-async function sendMessage(channelId, text, clientMsgId = uid()) {
-  const ch = state.channels.get(channelId);
-  state.outbox.set(clientMsgId, { channelId, text });
-  let pending = ch.messages.find((m) => m.clientMsgId === clientMsgId);
-  if (!pending) {
-    pending = { id: clientMsgId, clientMsgId, pending: true, user: state.session.user, text, ts: Date.now(), reactions: {} };
-    ch.messages.push(pending);
-  }
-  pending.failed = false;
-  if (channelId === state.active) renderMessages({ animateId: pending.id });
-  // Offline: don't let the transport queue it — it would be flushed before we
-  // re-join channels. The outbox is replayed at the end of resync().
-  if (socket.state !== 'open') return;
-
-  try {
-    const { message } = await socket.request('chat:send', { channelId, text, clientMsgId });
-    addMessage(message, clientMsgId);
-  } catch (err) {
-    if (err.code === 'disconnected' || err.code === 'timeout') return; // stays in outbox, retried on resync
-    state.outbox.delete(clientMsgId);
-    pending.failed = true;
-    toast(`Message not sent: ${err.message}`, 'error');
-    if (channelId === state.active) renderMessages({ keepScroll: true });
-  }
-}
-```
-
-*from `project/public/src/main.js`*
-
-```js
-function addMessage(message, clientMsgId, { silent = false } = {}) {
-  const ch = state.channels.get(message.channelId);
-  if (!ch) return;
-  ch.lastSeq = Math.max(ch.lastSeq, message.seq);
-  if (clientMsgId) {
-    state.outbox.delete(clientMsgId);
-    const i = ch.messages.findIndex((m) => m.clientMsgId === clientMsgId);
-    if (i >= 0) {
-      ch.messages[i] = message; // optimistic -> confirmed
-      if (message.channelId === state.active) renderMessages({ keepScroll: true });
-      return;
-    }
-  }
-  if (ch.messages.some((m) => m.id === message.id)) return;
-  ch.messages.push(message);
-  ch.messages.sort((a, b) => (a.seq ?? Infinity) - (b.seq ?? Infinity));
-  const mine = message.user.id === state.session.user.id;
-  if (message.channelId !== state.active || document.hidden) {
-    if (!mine) ch.unread++;
-    renderChannels();
-    renderTitle();
-  }
-  if (message.channelId === state.active && !silent) renderMessages({ animateId: message.id });
-}
-```
+### `main.js`: joining a huddle and rejoining after a drop
 
 **Joining a huddle.** When the socket drops, the server has already destroyed our Peer, so on `close` we tear down locally and set `state.rejoinHuddle`, and `resync()` rejoins:
 
@@ -2903,26 +3433,6 @@ async function joinHuddle(roomId = state.active) {
     hideHuddle();
     toast(`Could not join huddle: ${err.message}`, 'error');
   }
-}
-```
-
-**Rendering is XSS-safe by construction.** All user text goes through `escapeHtml` *before* the mini-markdown regexes run, and only `http(s)` links become anchors:
-
-*from `project/public/src/dom.js`*
-
-```js
-/** Tiny, safe markdown: escape first, then `code`, **bold**, _italic_, links. */
-export function renderText(text) {
-  let html = escapeHtml(text);
-  const codes = [];
-  html = html.replace(/```([\s\S]+?)```/g, (_, c) => `\u0000${codes.push(`<pre><code>${c.replace(/^\n/, '')}</code></pre>`) - 1}\u0000`);
-  html = html.replace(/`([^`\n]+)`/g, (_, c) => `\u0000${codes.push(`<code>${c}</code>`) - 1}\u0000`);
-  html = html
-    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|\s)_([^_\n]+)_(?=\s|$)/g, '$1<em>$2</em>')
-    .replace(/\bhttps?:\/\/[^\s<]+[^\s<.,:;"')\]]/g, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`)
-    .replace(/\n/g, '<br>');
-  return html.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[+i]);
 }
 ```
 
@@ -2957,9 +3467,321 @@ attach({ peerId, source, track, local = false, paused = false }) {
 
 The layout (`index.html`, `styles.css`) is a two-column CSS grid: a 264 px sidebar plus the main column. The huddle panel slides in above the messages. It's dark-only, with system fonts, CSS custom properties, and one breakpoint where the sidebar becomes a drawer. None of it matters for WebSockets, so read those files in the project directly.
 
+### ✅ Checkpoint: run this and you should see…
+
+**In Node, with fake WebRTC.** `mediasoup-client` ships a `FakeHandler` that plays the browser's `RTCPeerConnection` role, so the real `HuddleMedia` class can run the full dance against real workers:
+
+**`scratch/huddle-probe.mjs`** *(throwaway probe client)*
+
+```js
+// Two HuddleMedia clients in Node on mediasoup-client's FakeHandler (no real
+// WebRTC): Alice joins and turns on mic + cam, Bob joins late and prints what he gets.
+import { Device } from 'mediasoup-client';
+import { FakeHandler } from 'mediasoup-client/handlers/FakeHandler';
+import * as fakeParameters from 'mediasoup-client/fakeParameters';
+import { FakeMediaStreamTrack } from 'fake-mediastreamtrack';
+import { HuddleSocket } from '../public/src/ws-client.js';
+import { HuddleMedia } from '../public/src/media-client.js';
+
+const base = 'http://localhost:3001';
+async function participant(nickname) {
+  const post = (path, body, token) =>
+    fetch(base + path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(token && { authorization: `Bearer ${token}` }) },
+      body: JSON.stringify(body ?? {}),
+    }).then((r) => r.json());
+  const { token } = await post('/api/login', { nickname });
+  const socket = new HuddleSocket({ getUrl: async () => `ws://localhost:3001/ws?ticket=${(await post('/api/ticket', {}, token)).ticket}` });
+  const opened = new Promise((r) => socket.addEventListener('open', r, { once: true }));
+  socket.connect();
+  await opened;
+  const media = new HuddleMedia(socket, { createDevice: () => new Device({ handlerFactory: FakeHandler.createFactory(fakeParameters) }) });
+  for (const type of ['peerJoined', 'peerLeft', 'track', 'trackPaused', 'trackEnded', 'activeSpeaker', 'left']) {
+    media.addEventListener(type, (e) => console.log(`${nickname} <- ${type}`, JSON.stringify({ ...e.detail, track: undefined, consumer: undefined }).slice(0, 90)));
+  }
+  return { socket, media };
+}
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const alice = await participant('alice');
+await alice.media.join('general');
+await alice.media.produce('mic', new FakeMediaStreamTrack({ kind: 'audio' }));
+await alice.media.produce('cam', new FakeMediaStreamTrack({ kind: 'video' }));
+
+const bob = await participant('bob');
+await bob.media.join('general'); // late joiner: consumes Alice's two producers
+await pause(200);
+await alice.media.setMicMuted(true);
+await alice.media.stop('cam');
+await pause(200);
+await alice.media.leave();
+await pause(200);
+await bob.media.leave();
+alice.socket.close();
+bob.socket.close();
+```
+
+```bash
+# Terminal A
+LOG_LEVEL=warn node scratch/m8-media.mjs
+
+# Terminal B
+node scratch/huddle-probe.mjs
+```
+
+You should see Bob, the late joiner, consume both of Alice's existing producers, then follow her mute, camera-off and leave:
+
+```
+alice <- peerJoined {"id":"c_…","user":{…,"name":"bob",…}}
+bob <- peerJoined {"id":"c_…","user":{…,"name":"alice",…}}
+bob <- track {"peerId":"c_…","source":"mic","paused":false}
+bob <- track {"peerId":"c_…","source":"cam","paused":false}
+bob <- trackPaused {"peerId":"c_…","source":"mic"}
+bob <- trackEnded {"peerId":"c_…","source":"cam","kind":"video"}
+bob <- trackEnded {"peerId":"c_…","source":"mic","kind":"audio"}
+bob <- peerLeft {"peerId":"c_…"}
+alice <- left {"roomId":"general","reason":"left"}
+bob <- left {"roomId":"general","reason":"left"}
+```
+
+**In the browser, with real media.** Rebuild the bundle (`npm run build`), keep the M8 harness running, and open `http://localhost:3001` in two windows. Log in as two users, click **Start huddle** in `#general` in both, and allow the camera and mic. You should see two tiles, a green ring around whoever is speaking, and the mic-off badge when you mute. Stop the harness mid-call: the huddle closes, and when the harness comes back, `resync()` rejoins it automatically.
+
+**If it doesn't work**
+
+- *Tiles stay black but signaling succeeded*: the ICE candidates point at an address the browser can't reach, or UDP 40000–40100 is blocked. Check the candidates with the M8 probe and set `MEDIASOUP_ANNOUNCED_IP`.
+- *"Huddles need HTTPS (or localhost)"*: `navigator.mediaDevices` only exists in a secure context. `http://localhost` counts; `http://192.168.x.y` doesn't. Use localhost, or put TLS in front (M10).
+- *`produce()` never resolves*: a `'connect'` or `'produce'` listener didn't call `callback()`/`errback()`. There's no error, just a hang (see Common pitfalls).
+
 ---
 
-## 13.13 Step 10 — Tests
+## 13.12 M10 — Metrics, composition root, tests, hardening
+
+**Goal:** replace the harnesses with the real entry point, add the numbers you would alert on, prove the whole thing with tests, and know what changes when it leaves localhost.
+
+**Files you'll write:** `project/src/metrics.js`, `project/src/server.js`, `project/test/*.test.js`. You can now delete `project/scratch/`.
+
+### Metrics and the composition root
+
+`GET /metrics` exposes what you would alert on (Chapter 12): connection count, message rates, rejections by reason (origin, ticket, rate, invalid), rooms, peers, and per-worker CPU and RSS.
+
+**`project/src/metrics.js`**
+
+```js
+// In-process metrics. Rates use a 10-slot ring of per-second counters, so
+// "messages/sec" is a 10-second moving average, not a lifetime average.
+import express from 'express';
+
+class RateWindow {
+  #slots = new Array(10).fill(0);
+  #slotSecond = Math.floor(Date.now() / 1000);
+  total = 0;
+
+  #rotate() {
+    const now = Math.floor(Date.now() / 1000);
+    const steps = Math.min(now - this.#slotSecond, this.#slots.length);
+    for (let i = 0; i < steps; i++) {
+      this.#slots.shift();
+      this.#slots.push(0);
+    }
+    this.#slotSecond = now;
+  }
+
+  inc(n = 1) {
+    this.#rotate();
+    this.#slots[this.#slots.length - 1] += n;
+    this.total += n;
+  }
+
+  perSecond() {
+    this.#rotate();
+    // exclude the current (partial) second
+    const full = this.#slots.slice(0, -1);
+    return +(full.reduce((a, b) => a + b, 0) / full.length).toFixed(2);
+  }
+}
+
+export class Metrics {
+  startedAt = Date.now();
+  #in = new RateWindow();
+  #out = new RateWindow();
+  rejected = { origin: 0, ticket: 0, rate: 0, invalid: 0 };
+
+  countIn() {
+    this.#in.inc();
+  }
+  countOut() {
+    this.#out.inc();
+  }
+  countRejected(kind) {
+    this.rejected[kind] = (this.rejected[kind] ?? 0) + 1;
+  }
+
+  async snapshot({ hub, chat, media }) {
+    const mem = process.memoryUsage();
+    return {
+      uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
+      connections: hub.clients.size,
+      usersOnline: hub.users.length,
+      messages: {
+        inPerSec: this.#in.perSecond(),
+        outPerSec: this.#out.perSecond(),
+        inTotal: this.#in.total,
+        outTotal: this.#out.total,
+      },
+      rejected: this.rejected,
+      channels: chat.channels.list().length,
+      media: { available: media.available, ...media.stats(), workerDetails: await media.workerStats() },
+      memory: { rssMb: +(mem.rss / 1048576).toFixed(1), heapUsedMb: +(mem.heapUsed / 1048576).toFixed(1) },
+    };
+  }
+}
+
+/** GET /metrics (JSON) and GET /metrics?format=prometheus (text exposition). */
+export function metricsRouter(metrics, deps) {
+  const router = express.Router();
+  router.get('/', async (req, res) => {
+    const s = await metrics.snapshot(deps);
+    if (req.query.format !== 'prometheus') return res.json(s);
+    const lines = [
+      ['huddle_ws_connections', 'gauge', s.connections],
+      ['huddle_users_online', 'gauge', s.usersOnline],
+      ['huddle_ws_messages_in_total', 'counter', s.messages.inTotal],
+      ['huddle_ws_messages_out_total', 'counter', s.messages.outTotal],
+      ['huddle_media_rooms', 'gauge', s.media.rooms],
+      ['huddle_media_peers', 'gauge', s.media.peers],
+      ['huddle_media_workers', 'gauge', s.media.workers],
+    ].flatMap(([name, type, v]) => [`# TYPE ${name} ${type}`, `${name} ${v}`]);
+    for (const [kind, v] of Object.entries(s.rejected)) lines.push(`huddle_ws_rejected_total{reason="${kind}"} ${v}`);
+    res.type('text/plain; version=0.0.4').send(lines.join('\n') + '\n');
+  });
+  return router;
+}
+```
+
+The "messages/sec" value is a **10-second moving window**, not `total / uptime`, which would flatten every spike into nothing.
+
+`server.js` is the only file that creates things. Everything else receives its dependencies as arguments, which is why a test can start a full Huddle on port 0 with `createHuddleServer({ media: { enabled: false } })`:
+
+**`project/src/server.js`**
+
+```js
+// Composition root: builds every piece and wires them together. Nothing else
+// imports config or creates singletons, which is what makes it testable —
+// tests call createHuddleServer() with overrides and port 0.
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import { loadConfig } from './config.js';
+import { createAuth } from './auth.js';
+import { Hub } from './ws/hub.js';
+import { MessageRouter } from './ws/router.js';
+import { createGateway } from './ws/gateway.js';
+import { registerChat } from './chat/handlers.js';
+import { createMedia } from './media/index.js';
+import { Metrics, metricsRouter } from './metrics.js';
+import { logger } from './logger.js';
+
+const publicDir = fileURLToPath(new URL('../public', import.meta.url));
+
+export async function createHuddleServer(overrides = {}) {
+  const config = loadConfig(overrides);
+  const app = express();
+  const server = http.createServer(app);
+  const hub = new Hub();
+  const router = new MessageRouter();
+  const metrics = new Metrics();
+  const auth = createAuth(config);
+
+  // Media needs chat (to validate room ids) and chat needs media (to list
+  // huddles in the welcome snapshot) — break the cycle with a late-bound getter.
+  let media;
+  const chat = registerChat({ router, hub, config, getHuddles: () => media?.huddles() ?? [] });
+  media = await createMedia({ config, hub, router, validateRoom: (id) => chat.channels.get(id) });
+
+  app.disable('x-powered-by');
+  app.set('trust proxy', 'loopback');
+  app.use((req, res, next) => {
+    res.set({
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy':
+        "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+    });
+    next();
+  });
+  app.use(express.json({ limit: '8kb' }));
+  app.use('/api', auth.router);
+  app.get('/api/config', (req, res) => res.json({ media: media.available, wsPath: config.ws.path }));
+  app.get('/healthz', (req, res) => res.json({ ok: true }));
+  app.use('/metrics', metricsRouter(metrics, { hub, chat, media }));
+  app.use(express.static(publicDir, { extensions: ['html'] }));
+
+  const gateway = createGateway({ server, config, tickets: auth.tickets, router, hub, metrics });
+
+  return {
+    app,
+    server,
+    config,
+    hub,
+    chat,
+    media,
+    auth,
+    listen(port = config.port, host = config.host) {
+      return new Promise((resolve) => server.listen(port, host, () => resolve(server.address())));
+    },
+    async close() {
+      gateway.close();
+      media.close();
+      auth.close();
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+// Run directly: `node src/server.js`
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const huddle = await createHuddleServer();
+  const addr = await huddle.listen();
+  logger.info(`Huddle listening on http://localhost:${addr.port}`, {
+    media: huddle.media.available,
+    announcedIp: huddle.config.media.announcedIp,
+    rtcPorts: `${huddle.config.media.rtcMinPort}-${huddle.config.media.rtcMaxPort}`,
+  });
+
+  let stopping = false;
+  const shutdown = async (signal) => {
+    if (stopping) return;
+    stopping = true;
+    logger.info('shutting down', { signal });
+    const force = setTimeout(() => process.exit(1), 5000).unref();
+    await huddle.close();
+    clearTimeout(force);
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+```
+
+- **Chat and media depend on each other**: media validates room ids against channels, and the chat welcome lists huddles. A late-bound getter (`() => media?.huddles()`) breaks the cycle without a global.
+- **Shutdown order:** close all sockets with **1001 Going Away** (clients reconnect with backoff, ideally to another instance behind the load balancer), close media, then stop the HTTP server. A 5 s watchdog forces exit if something hangs.
+- **Security headers** include a CSP that allows `ws:`/`wss:` for `connect-src` and `blob:` for media. `frame-ancestors 'none'` blocks clickjacking.
+
+Try it:
+
+```bash
+npm start &
+curl -s localhost:3000/metrics | jq .
+curl -s -XPOST localhost:3000/api/login -H 'content-type: application/json' -d '{"nickname":"ada"}'
+curl -si 'localhost:3000/ws?ticket=nope' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' | head -1
+# HTTP/1.1 401 Unauthorized
+```
+
+### Tests
 
 `npm test` runs four suites (27 tests, about 3 s):
 
@@ -3108,9 +3930,7 @@ test('a dead worker closes its rooms and is replaced', async (t) => {
 
 > **What the fake handler does not test:** real ICE/DTLS connectivity and actual RTP. For that, run a browser E2E test (Exercise 3). During development of this chapter, a Playwright script with Chrome's `--use-fake-device-for-media-stream` confirmed that a remote tile receives a 640 px wide video track.
 
----
-
-## 13.14 Running beyond localhost
+### Hardening: running beyond localhost
 
 ```mermaid
 flowchart LR
@@ -3125,6 +3945,33 @@ flowchart LR
 4. Set `NODE_ENV=production`, `JWT_SECRET`, and `ALLOWED_ORIGINS=https://your.host`.
 5. Watch `/metrics` for `media.workers` dropping below the configured count (a worker died), `rejected.rate` spikes (abuse), and `messages.outPerSec` (fan-out load).
 
+### ✅ Checkpoint: run this and you should see…
+
+```bash
+npm test                                             # ℹ tests 27 · ℹ pass 27 (about 3 s)
+NODE_ENV=test node --test test/auth.test.js          # one suite: 6 tests
+NODE_ENV=test node --test test/integration.test.js   # 9 tests, media disabled
+NODE_ENV=test node --test test/media.test.js         # 2 tests, real mediasoup workers
+NODE_ENV=test node --test --test-name-pattern="HuddleSocket" test/integration.test.js   # one test
+```
+
+Then run the real server (`npm run dev`, or `npm start` after a build) and check the HTTP surface:
+
+```bash
+curl -s localhost:3000/healthz                                    # {"ok":true}
+curl -s localhost:3000/api/config                                 # {"media":true,"wsPath":"/ws"}
+curl -s 'localhost:3000/metrics?format=prometheus' | head -4      # # TYPE huddle_ws_connections gauge …
+curl -sI localhost:3000/ | grep -i content-security-policy        # the CSP from server.js
+```
+
+Finally, open two browser windows on `http://localhost:3000` and repeat the M6 and M9 browser checks against the real server while `curl -s localhost:3000/metrics | jq .media` shows `rooms`, `peers`, `producers` and `consumers` changing.
+
+**If it doesn't work**
+
+- *`npm test -- test/media.test.js` still runs every suite*: the `test` script already passes a glob, and npm appends your argument to it. Call `node --test <file>` directly, as above.
+- *`media.test.js` reports its tests as skipped*: mediasoup couldn't start workers on this machine (see M7). The chat suites still cover everything else.
+- *The test run hangs at the end*: something is still open. Every `HuddleSocket` a test creates must be `close()`d (note `t.after(() => sock.close())`), and every server `huddle.close()`d.
+
 ---
 
 ## Common pitfalls
@@ -3138,6 +3985,38 @@ flowchart LR
 - **Putting the JWT in the WebSocket URL "just for now".** It ends up in logs and stays valid for 12 hours. Use tickets from the first day.
 - **Broadcasting typing on every keystroke.** Throttle on the client (3 s) and let a server TTL handle expiry. Broadcast changes only.
 - **Rendering chat with `innerHTML` before escaping.** Escape first, then apply formatting to the escaped string, and only allow `https?://` links.
+
+## Check your understanding
+
+1. The browser could simply put its JWT in the WebSocket URL. Why does Huddle add a second credential, and why does `TicketStore.consume()` delete the ticket *before* checking whether it has expired?
+<details><summary>Answer</summary>
+
+`new WebSocket(url)` can't set headers, so whatever authenticates the upgrade ends up in the URL, and URLs leak into proxy logs, browser history and `Referer` headers. A leaked 12-hour JWT is a stolen session; a leaked ticket is worthless because it's single-use and expires in 30 s. The JWT only ever travels in an `Authorization` header to `/api/ticket`. Deleting first means a ticket can never be used twice, even if two upgrades race with the same ticket or the ticket turns out to be expired.
+</details>
+
+2. Alice sends a message, and her Wi-Fi drops before the `ok` reply arrives. The server *did* receive it. Walk through what happens when she reconnects. Why doesn't Bob see the message twice, and why is the retry sent at the end of `resync()` rather than from `HuddleSocket`'s outbox?
+<details><summary>Answer</summary>
+
+The pending request rejects with `disconnected`, so `sendMessage` leaves the message in `state.outbox` (still shown as *sending…*). After reconnect, `resync()` first re-joins channels via `sys:resync`, then replays the outbox with the **same** `clientMsgId`. `Channel.append()` finds `user.id:clientMsgId` in its de-dup map and returns the original message with `duplicate: true` without broadcasting again, so Bob sees it once and Alice's optimistic copy is replaced by the confirmed one. The transport outbox flushes on `open`, *before* the re-join, so the send would fail with `not_member`.
+</details>
+
+3. After a reconnect, the `session:welcome` carries a different `epoch` from the previous one. What does that tell the client, and what would silently go wrong if it ignored it?
+<details><summary>Answer</summary>
+
+The server restarted and lost its in-memory history, so `seq` counters started again from 0. If the client sent `sys:resync {general: 41}`, the server would return only messages with `seq > 41`, which means the first 41 messages after the restart would never be shown, with no error. On an epoch change, `main.js` resets every channel's cursor and re-joins from scratch (unsent messages survive in the outbox).
+</details>
+
+4. Why does `media:consume` create the consumer with `paused: true`, and why does the server store the *device's* `rtpCapabilities` from `media:join` instead of using the router's?
+<details><summary>Answer</summary>
+
+A consumer that starts flowing immediately would send the first keyframe before the client has created its local consumer and attached the track, so the video would stay frozen until the next keyframe. The client calls `media:resumeConsumer` once it's ready. The device's capabilities describe what *that receiving browser* can decode, and `router.canConsume()` needs them to reject an incompatible codec with a clear `cannot_consume` error instead of forwarding media the browser can't play.
+</details>
+
+5. A mediasoup worker is OOM-killed in the middle of a huddle in `#random`. Trace what happens on the server and in each participant's browser until the call is back.
+<details><summary>Answer</summary>
+
+The worker emits `died`. `WorkerPool` removes it (so `next()` never picks it again), emits `workerDied`, and schedules a respawn after 1 s. `MediaService` closes every room whose `worker` is the dead one with reason `worker_died`. `Room.close()` broadcasts `media:roomClosed`, closes its peers and clears `client.peer`, and `huddle:update` tells the sidebar. In the browser, `HuddleMedia` tears down on `media:roomClosed` and emits `left` with that reason. Joining again calls `getOrCreateRoom()`, which creates a fresh Router on a healthy worker. `media.test.js` checks exactly this sequence.
+</details>
 
 ## Exercises
 

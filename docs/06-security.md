@@ -6,6 +6,8 @@
 
 Prerequisites: the `noServer` + `upgrade` pattern from [Chapter 3](03-express-integration.md) and the `{type,id,payload,replyTo}` envelope + zod validation from [Chapter 4](04-messaging-patterns.md). Heartbeats and backpressure from [Chapter 5](05-reliability.md) are also part of your security posture (a dead or slow client is a resource leak).
 
+> **In plain English:** Opening a WebSocket is like letting a visitor into an office building. The front door (the HTTP upgrade) is the only place with a security desk, and once inside the visitor can stay for hours. So you check ID properly at the door (Origin, a short-lived ticket, connection limits) and you still check their badge at every room they try to enter (per-message authorization, validation, a [token bucket](glossary.md#token-bucket) rate limit). The browser's usual cross-site guard, CORS, does not stand at this door, which is why [CSWSH](glossary.md#cswsh) exists and why you post your own guard.
+
 ---
 
 ## 1. Why WebSocket security is different
@@ -335,6 +337,8 @@ After the upgrade, "slow" becomes "idle": sockets that never send anything. The 
 The mirror image: a client that never *reads*. Every `ws.send` to it accumulates in `ws.bufferedAmount` in your process memory. Check `bufferedAmount` before sending and terminate clients above a threshold (Chapter 5, backpressure).
 
 ### Compression bombs and `permessage-deflate`
+
+> 🔬 **Deep dive — optional on first read.** This subsection covers zlib memory, thread-pool and side-channel details. On a first read, the one thing to remember is: leave `perMessageDeflate` off (the `ws@8` default) and keep `maxPayload` small.
 
 `permessage-deflate` compresses each message with zlib. It sounds free; it isn't:
 
@@ -831,6 +835,71 @@ curl -i -N --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
 - (3) `GETDEL` is atomic, which is exactly what makes "single use" hold across processes. ioredis exposes it as `redis.getdel(key)`.
 - (4) Add sockets to the index in `connection`, remove in `close`. Remember a user may have several tabs.
 - (5) With the `ws` client: `new WebSocket(url, { origin: 'https://evil.example' })`; listen to `'unexpected-response'` to read `res.statusCode` for rejected upgrades.
+
+</details>
+
+---
+
+## Check your understanding
+
+1. Your Express app already has `app.use(cors({ origin: 'https://chat.example.com' }))`. Does that stop a page on `evil.example` from opening a WebSocket to your server with the victim's cookies?
+
+<details><summary>Answer</summary>
+
+**No.** CORS has no effect on WebSocket connections: there is no preflight for `new WebSocket()`, and the `cors()` middleware never runs for the `upgrade` event. The browser opens the socket, attaches cookies, and the attacker's page can read every message (Cross-Site WebSocket Hijacking). The protection is an exact-match **Origin allowlist in the `upgrade` handler**, and ideally the ticket pattern too. See §3 and §12.
+
+</details>
+
+2. Spot the bugs in this Origin check:
+
+   ```js
+   server.on('upgrade', (req, socket, head) => {
+     if (!req.headers.origin.endsWith('example.com')) return reject(socket, 403, 'bad origin');
+     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+   });
+   ```
+
+<details><summary>Answer</summary>
+
+1. `endsWith('example.com')` also accepts `https://evilexample.com` (and any attacker-registered domain ending that way). Compare against an explicit `Set` of full origins with exact matching.
+2. If the `Origin` header is missing (non-browser clients), `req.headers.origin` is `undefined` and `.endsWith` throws inside the upgrade listener. Handle the missing case on purpose: reject it, or allow it only for token-authenticated clients.
+
+See §3 and the pitfall "Origin checks with substring/regex matching".
+
+</details>
+
+3. Why does this chapter recommend `POST /api/ticket` → `wss://…/ws?ticket=…` instead of simply `wss://…/ws?token=<JWT>`? The ticket is in the URL too.
+
+<details><summary>Answer</summary>
+
+URLs get logged by nginx, load balancers, APM tools and browser history, so a JWT in the query string is a credential sitting in logs. The ticket is **random, single-use (deleted on first redemption), valid for ~30 s, and bound to the client IP**, so by the time it appears in a log it is worthless. The long-lived JWT only travels in an `Authorization` header over normal HTTPS. As a bonus, an attacker's page can't get a ticket (CORS *does* apply to that `fetch`), so it also defeats CSWSH. See §4, "The ticket pattern".
+
+</details>
+
+4. Spot two authorization bugs in this handler:
+
+   ```js
+   case 'chat:message': {
+     const { room, from, text } = msg.payload;
+     broadcast(room, { room, from, text, at: Date.now() });
+     break;
+   }
+   ```
+
+<details><summary>Answer</summary>
+
+1. **Identity comes from the payload.** Any client can send `from: 'admin'`. Use `ws.user.id`, which the server set at upgrade time.
+2. **No membership check.** A client can post to `admins` without ever joining (or after being refused). Check `ws.rooms.has(room)` on every action, not only at join time.
+
+See §5, "Authorization: per message, per room".
+
+</details>
+
+5. The example's token bucket has `capacity: 10`, refills at 5 tokens/s, and closes after 3 strikes. What happens when a client fires 30 messages in a few milliseconds (the **Flood ×30** button)? Why does the bucket check run *before* `JSON.parse`?
+
+<details><summary>Answer</summary>
+
+The bucket starts full, so roughly the first **10** messages are handled. Almost no time passes, so almost nothing refills, and the following messages are rejected. Each rejection gets an error reply and a strike, and after the third strike the server closes with **1008 (Policy Violation)**. The check runs first so a flood costs you as little CPU as possible: no parsing, validation or fan-out for messages you'll reject anyway. See §8 and §6, "Strike counting".
 
 </details>
 

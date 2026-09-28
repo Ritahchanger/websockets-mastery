@@ -4,6 +4,54 @@
 
 **What you'll learn:** Why WebSockets exist and what problem they solve better than polling, long-polling and Server-Sent Events; exactly what happens on the wire when a browser opens `new WebSocket(...)` — the HTTP/1.1 Upgrade handshake, the `Sec-WebSocket-Key` → SHA-1 → `Sec-WebSocket-Accept` proof, the binary frame format bit by bit, why client frames are masked, control frames (ping, pong, close), close codes, subprotocols and extensions. You will finish by reading and running a WebSocket server written with **nothing but `node:http` and `node:crypto`**, so that every later chapter's library feels like a convenience rather than magic.
 
+> **In plain English:** Normal HTTP is like sending letters: the browser writes, the server replies, and the server can never write first. A WebSocket is like turning that letter exchange into a phone call that stays open: after one special "can we switch to a call?" request, both sides can talk whenever they want. The key idea: **one ordinary HTTP request upgrades into a long-lived, two-way channel** that carries small messages with almost no overhead.
+
+New to HTTP/TCP? Read [Chapter 0](00-http-tcp-primer.md) first.
+
+---
+
+## Quick win: WebSockets in 5 minutes
+
+Before the theory, let's see one work. Save this as `quick-win.js` in the repo root (where `npm install` put the `ws` package) and run `node quick-win.js`:
+
+```js
+// quick-win.js — an echo + broadcast WebSocket server
+import { WebSocketServer, WebSocket } from 'ws';
+
+const wss = new WebSocketServer({ port: 3000 });
+
+wss.on('connection', (ws) => {
+  ws.send(`welcome! ${wss.clients.size} client(s) connected`);
+  ws.on('message', (data) => {
+    for (const client of wss.clients) {                 // broadcast to everyone
+      if (client.readyState === WebSocket.OPEN) client.send(`someone said: ${data}`);
+    }
+  });
+});
+console.log('listening on ws://localhost:3000');
+```
+
+Now open a browser tab (a blank tab or any `http://localhost` page), open DevTools → **Console**, and paste:
+
+```js
+const ws = new WebSocket('ws://localhost:3000');
+ws.onopen = () => ws.send('hello from the browser');
+ws.onmessage = (event) => console.log('server:', event.data);
+ws.onclose = (event) => console.log('closed', event.code);
+// Later, type: ws.send('anything you like')
+```
+
+You should see `server: welcome! 1 client(s) connected` and then `server: someone said: hello from the browser`. Open a **second tab**, paste the same snippet, and type `ws.send('hi from tab 2')`: the message appears in **both** consoles.
+
+**What just happened?**
+
+1. `new WebSocket(...)` sent one ordinary HTTP `GET` with an `Upgrade: websocket` header ([§1.2](#12-the-opening-handshake-rfc-6455-4)). The `ws` library answered `101 Switching Protocols`, and the [TCP](glossary.md#tcp) connection stayed open.
+2. From then on, **either side can send at any time**. The server spoke first (`welcome!`) without being asked, which plain HTTP can't do.
+3. `wss.clients` is the set of open connections, so looping over it is a **broadcast**: one tab's message is pushed to every tab instantly, with no polling.
+4. Look at DevTools → Network → the `ws://localhost:3000` entry → **Messages**: every line you sent or received is one WebSocket message.
+
+The rest of this chapter explains exactly what those bytes look like, and why. Chapter 2 builds on this server properly.
+
 ---
 
 ## 1.1 The problem: HTTP is request/response
@@ -35,7 +83,7 @@ sequenceDiagram
 ```
 
 - **Latency** is up to N seconds (average N/2).
-- **Waste**: most requests return nothing, yet each carries full HTTP headers (often 500–2000 bytes with cookies) and costs a round trip plus server work.
+- **Waste**: most requests return nothing, yet each carries full HTTP headers (often 500–2000 bytes with cookies) and costs a [round trip (RTT)](00-http-tcp-primer.md#03-latency-and-rtt) plus server work.
 - Trivial to implement and works through every proxy.
 
 ### Long polling
@@ -70,7 +118,7 @@ A standard browser API (`EventSource`) over a single long-lived HTTP response wi
 
 ### WebSockets
 
-One HTTP request that **upgrades** the TCP connection into a persistent, **full-duplex**, message-oriented channel. After the handshake, either side can send a message at any time with only **2–14 bytes of framing overhead**.
+One HTTP request that **upgrades** the TCP connection into a persistent, **[full-duplex](glossary.md#full-duplex)** (both sides can talk at once), message-oriented channel. After the handshake, either side can send a message at any time with only **2–14 bytes of framing overhead**.
 
 ```mermaid
 sequenceDiagram
@@ -91,7 +139,7 @@ sequenceDiagram
 | | Short polling | Long polling | SSE | WebSocket |
 |---|---|---|---|---|
 | Direction | client pull | server push (emulated) | server → client | **full duplex** |
-| Latency | up to poll interval | ~1 RTT | ~0 | ~0 |
+| Latency | up to poll interval | ~1 [RTT](glossary.md#rtt) | ~0 | ~0 |
 | Per-message overhead | full HTTP req+resp | full HTTP resp + next req | a few bytes | 2–14 bytes |
 | Binary data | yes (per request) | yes | **no** (text only) | **yes** |
 | Auto reconnect | n/a | manual | **built in** | manual (chapter 5) |
@@ -204,6 +252,8 @@ If you don't listen to `'upgrade'`, Node destroys the socket. Every WebSocket li
 
 ## 1.3 The frame format (RFC 6455 §5.2)
 
+> 🔬 **Deep dive — optional on first read.** You can skip to [§1.5](#15-control-frames-ping-pong-close) and come back later; libraries handle this for you.
+
 After `101`, both sides exchange **frames**. A *message* consists of one or more frames. Here is the layout:
 
 ```
@@ -280,6 +330,8 @@ The server replies `Hi` unmasked: `81 02 48 69`. Four bytes on the wire for a wh
 
 ### Fragmentation
 
+> 🔬 **Deep dive — optional on first read.** You can skip to [§1.5](#15-control-frames-ping-pong-close) and come back later; libraries handle this for you. The one idea to keep: *TCP is a byte stream, WebSocket delivers whole messages.*
+
 A single message can be split into frames: first frame has the real opcode and `FIN=0`, middle frames have opcode `0x0` and `FIN=0`, the last has opcode `0x0` and `FIN=1`. This lets a sender stream a message whose size it doesn't know upfront. **Control frames may be interleaved** between fragments (so a ping can get through during a huge upload), but control frames themselves can never be fragmented and their payload is at most **125 bytes**.
 
 ```
@@ -292,6 +344,8 @@ Important consequence: **WebSocket is message-oriented, TCP is stream-oriented.*
 ---
 
 ## 1.4 Masking: why client→server frames are masked
+
+> 🔬 **Deep dive — optional on first read.** You can skip to [§1.5](#15-control-frames-ping-pong-close) and come back later; libraries handle this for you. Short version: browsers scramble outgoing frames to protect old proxies. It is **not** encryption.
 
 Every frame from a client is XOR'd with a fresh random 4-byte key:
 
@@ -463,6 +517,8 @@ Every one of these limitations shapes the design of later chapters.
 ---
 
 ## 1.8 Build it: a WebSocket server with zero dependencies
+
+> 🔬 **Deep dive — optional on first read.** You can skip to [Common pitfalls](#common-pitfalls) and come back later; libraries handle this for you. The [Quick win](#quick-win-websockets-in-5-minutes) server above is all you need to continue to Chapter 2.
 
 Now let's prove we understand all of the above by writing a server with only Node built-ins. It will:
 
@@ -1110,6 +1166,40 @@ That list is precisely why you use a library in production — but now you know 
 - Ex 4: `0x01` (not `0x81`) is TEXT without FIN; `0x00` is CONT without FIN; `0x80` is CONT with FIN.
 - Ex 5: wrap `decoder.decode(payload)` in `try/catch` and call `sendClose(1007, 'invalid utf-8')`.
 
+</details>
+
+---
+
+## Check your understanding
+
+1. Why does a WebSocket connection start as an HTTP request instead of a brand-new protocol on its own port?
+<details><summary>Answer</summary>
+
+So it can reuse ports 80/443, pass through existing proxies and load balancers, and carry cookies and other normal HTTP information. The `Upgrade: websocket` request is ordinary HTTP until the server answers `101 Switching Protocols`.
+</details>
+
+2. What happens if your server answers the upgrade request with `401 Unauthorized`? What does browser JavaScript see?
+<details><summary>Answer</summary>
+
+The handshake fails. The browser fires `error` and then `close` with code **1006**, and the `401` status is **not** exposed to JavaScript. To show a meaningful error, pre-check auth over HTTP, or accept and then close with an application code such as `4001`.
+</details>
+
+3. Is masking a security feature that hides your data? Why do clients mask frames?
+<details><summary>Answer</summary>
+
+No. The masking key is sent right next to the payload, so anyone can unmask it. Masking exists to stop malicious pages from crafting bytes that old, confused proxies would misread as HTTP (cache poisoning). Use `wss://` (TLS) for secrecy.
+</details>
+
+4. Read the code: in the Quick win server, what happens if you remove the `client.readyState === WebSocket.OPEN` check?
+<details><summary>Answer</summary>
+
+Sockets that are closing still sit in `wss.clients` for a moment. Without the check, the server tries to `send()` to them: the data is silently dropped (or an error is passed to the send callback). It's wasteful, and it hides intent, so check `readyState` before sending to *other* sockets.
+</details>
+
+5. Only the server needs to push updates (e.g. a live score feed), and the client never sends anything. WebSocket or SSE?
+<details><summary>Answer</summary>
+
+Consider **SSE** first: it's one-directional (server → client), plain HTTP, and reconnects automatically. Choose WebSockets when both sides send frequently or you need binary data.
 </details>
 
 ---

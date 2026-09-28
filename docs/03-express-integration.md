@@ -4,6 +4,8 @@
 
 **What you'll learn:** How to run Express and `ws` on **one port, one `http.Server`**; why `noServer: true` + `server.on('upgrade')` is the production pattern; how to route upgrades to **multiple WebSocket endpoints** by path; how to **authenticate during the handshake** (session cookie, token in the query string, token in `Sec-WebSocket-Protocol`) and reject unauthenticated clients with a proper `401` written directly to the socket; how to hand the authenticated user to your `connection` handler; how to serve the browser client from Express; and how to make REST and WebSockets cooperate — e.g. `POST /api/broadcast` pushing to connected sockets.
 
+> **In plain English:** Express is a receptionist for ordinary HTTP requests, but it never sees WebSocket connection requests: those arrive on a separate "side door" of the same Node server, the `'upgrade'` event. You stand at that door, check the visitor's badge (cookie or token) and where they came from (`Origin`), and only then let `ws` turn the request into a WebSocket. The key idea: **one server and one port for both HTTP and WebSockets, with authentication done before the connection is accepted.**
+
 ---
 
 ## 3.1 The core idea: Express doesn't handle upgrades
@@ -802,6 +804,40 @@ Wait 61 seconds and try the same token again: `rejected with HTTP 401` — the t
 - Ex 4: parse the origin with `new URL(origin)`, compare `protocol` exactly and check `hostname === 'example.com' || hostname.endsWith('.example.com')`.
 - Ex 5: filter `wssChat.clients` by `ws.user.name === to`; `res.status(404)` if the count is 0.
 
+</details>
+
+---
+
+## Check your understanding
+
+1. Why can't you handle a WebSocket connection with `app.get('/ws', ...)` in Express?
+<details><summary>Answer</summary>
+
+Node's `http.Server` doesn't send upgrade requests to the normal `(req, res)` handler that Express uses. It emits a separate **`'upgrade'`** event with `(req, socket, head)` and no `res`. You handle WebSockets there, on the same server Express uses.
+</details>
+
+2. What does `noServer: true` give you compared with `{ server }`?
+<details><summary>Answer</summary>
+
+With `{ server }`, `ws` accepts every upgrade itself. With `noServer: true`, **you** handle `'upgrade'` and decide: route by path, check `Origin`, authenticate, and reject with a raw HTTP response, before calling `wss.handleUpgrade(...)` and emitting `'connection'`.
+</details>
+
+3. Read the code: your upgrade handler does `const user = await authenticate(req)` without `socket.on('error', ...)` first. What can go wrong?
+<details><summary>Answer</summary>
+
+If the client disconnects while you're awaiting (a DB lookup or JWT verification), the raw socket can emit `'error'` with no listener, and the process crashes. Guard the raw socket during async work and remove the guard once `ws` owns it.
+</details>
+
+4. You authenticate with a session cookie. What happens if you forget to check the `Origin` header?
+<details><summary>Answer</summary>
+
+Any website the user visits can open a WebSocket to your server, and the browser **attaches the user's cookie automatically**. The attacker's page then acts as the user. This is Cross-Site WebSocket Hijacking (Chapter 6). CORS does not protect WebSockets, so the Origin check is your job.
+</details>
+
+5. A user logs out over REST, but their WebSocket stays open. Are they still authenticated on the socket?
+<details><summary>Answer</summary>
+
+Yes. Auth was checked only once, at handshake time, and the socket lives on. You must **revoke explicitly**: find that user's open sockets and close them (for example with an application close code) on logout or token expiry.
 </details>
 
 ---

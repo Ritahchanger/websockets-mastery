@@ -28,6 +28,7 @@ npm run ex:02        # run any chapter example, then open http://localhost:3000
 
 | # | Chapter | Level | Example |
 |---|---------|-------|---------|
+| 0 | [HTTP & TCP in 10 minutes (primer)](docs/00-http-tcp-primer.md) | Beginner | — |
 | 1 | [Fundamentals: HTTP → WebSocket, handshake, frames](docs/01-fundamentals.md) | Beginner | `examples/01-raw-handshake` — a WS server with **zero libraries** |
 | 2 | [Your first server with `ws`](docs/02-first-server-ws.md) | Beginner | `examples/02-echo-ws` |
 | 3 | [Integrating with Express](docs/03-express-integration.md) | Intermediate | `examples/03-express-ws` |
@@ -41,6 +42,8 @@ npm run ex:02        # run any chapter example, then open http://localhost:3000
 | 11 | [mediasoup: building an SFU](docs/11-mediasoup.md) | Expert | `examples/11-mediasoup-minimal` |
 | 12 | [Production: TLS, TURN, deployment, monitoring](docs/12-production.md) | Expert | `examples/12-production` — nginx/Caddy, coturn, Docker, systemd/PM2 configs |
 | 13 | [Capstone: building Huddle](docs/13-capstone-huddle.md) | Expert | `project/` |
+
+📖 Stuck on a term? See the [Glossary](docs/glossary.md).
 
 ## How to study
 

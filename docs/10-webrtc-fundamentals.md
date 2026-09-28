@@ -4,6 +4,8 @@
 
 **What you'll learn.** Everything so far has moved *messages* over a WebSocket. Audio and video are different: they need sub-150 ms latency, they tolerate loss better than delay, and they are heavy (hundreds of kbit/s to several Mbit/s per stream). In this chapter you will learn why a WebSocket is the wrong pipe for media but the *right* pipe for **signaling**, and you will learn the pieces of WebRTC that do carry the media: `getUserMedia`, `RTCPeerConnection`, SDP offer/answer, ICE candidates and trickle ICE, STUN/TURN (including a working `coturn` config), NAT types, DTLS-SRTP, and data channels. You will implement the **perfect negotiation** pattern, which makes renegotiation glare-proof, and build a 1:1 / small-mesh video call with an Express + `ws` signaling server. Finally you will do the bandwidth math that shows why mesh stops working at around 4 peers. That result leads into Chapter 11 (mediasoup).
 
+> **In plain English:** Two browsers want to send video straight to each other, without your server carrying it. They can't find each other on their own, so your WebSocket server acts as a **matchmaker**: it passes a few small notes back and forth ("here's what I can send", "here's an address you might reach me at"). Once the browsers have swapped those notes, they connect directly and the video flows peer-to-peer. The server only carries the notes. That note-passing is called [signaling](glossary.md#signaling), and it is just the WebSocket messaging you already know from chapters 3–5. The hard part is the vocabulary: [SDP](glossary.md#sdp) is the "what", [ICE](glossary.md#ice) is the "where", and [STUN](glossary.md#stun)/[TURN](glossary.md#turn) help browsers stuck behind home routers and firewalls.
+
 ---
 
 ## 1. Why not just send video over the WebSocket?
@@ -71,6 +73,9 @@ One `RTCPeerConnection` (PC) is one encrypted, congestion-controlled session to 
 ### 2.3 SDP offer/answer: agreeing on *what*
 
 SDP (Session Description Protocol, RFC 8866) is a text blob that says "here are the media sections I want, the codecs I support, my ICE credentials and my DTLS fingerprint". One side creates an **offer** and the other replies with an **answer**. Here is a trimmed offer with comments:
+
+> 🔬 **Deep dive — optional on first read.** You will never write SDP by hand, and after this chapter mediasoup-client writes it for you. Skim the annotated offer below, then read the two rules underneath it. Those two rules are the part you need.
+
 
 ```text
 v=0
@@ -166,6 +171,8 @@ As a rule of thumb, 10–20 % of real-world sessions need TURN. If you ship with
 - **TURN** relays every media byte, so it costs bandwidth, which is why you run it yourself and require credentials.
 
 #### coturn: a production-ish `turnserver.conf`
+
+> 🔬 **Deep dive — optional on first read.** You only need this when you actually deploy a TURN server. On a first read, remember that TURN exists, that it relays media, and that it needs short-lived credentials. Then skip ahead to §2.6.
 
 ```ini
 # /etc/turnserver.conf — coturn 4.6+
@@ -903,6 +910,43 @@ try {
 - (5) `const p = sender.getParameters(); p.encodings[0].maxBitrate = 300_000; await sender.setParameters(p);`
 </details>
 
+## Check your understanding
+
+1. **Conceptual.** Why is a WebSocket a good pipe for signaling but a poor pipe for live video?
+
+   <details><summary>Answer</summary>
+
+   A WebSocket runs over TCP, which retransmits every lost packet in order. One lost packet holds up everything behind it (head-of-line blocking), so under loss the video arrives late and then all at once. Live media would rather drop a late packet and move on, which WebRTC's SRTP-over-UDP does. Signaling is the opposite: a few small messages that must all arrive, in order. That is exactly what TCP and a WebSocket are good at.
+   </details>
+
+2. **What happens if…** you ship with only a STUN server configured, and a user is on a mobile network behind symmetric NAT (or a corporate firewall that blocks UDP)?
+
+   <details><summary>Answer</summary>
+
+   Signaling works: the WebSocket connects and offers and answers are exchanged. But ICE never finds a working candidate pair, so the call sits on "connecting..." forever. Symmetric NAT gives the peer a different public port from the one STUN saw, and a UDP-blocking firewall stops everything that isn't TCP/TLS. Only a **TURN** relay, ideally reachable over TLS on 443, rescues these users. That is 10–20 % of real sessions.
+   </details>
+
+3. **Read the code.** In the perfect negotiation `onSignal` from §3, the **impolite** peer receives an `offer` while `makingOffer` is `true`. Trace what happens. Why is `addIceCandidate` wrapped in a `try/catch` that re-throws only when `!ignoreOffer`?
+
+   <details><summary>Answer</summary>
+
+   `readyForOffer` is `false` because `makingOffer` is true, so `offerCollision` is `true`. The peer is impolite, so `ignoreOffer = true` and the function returns: the incoming offer is dropped and the impolite peer's own offer wins. The remote side keeps trickling candidates that belong to the offer that was dropped. Adding them fails, and that failure is expected, so it is swallowed. Any *other* candidate error is a real bug and is re-thrown.
+   </details>
+
+4. **What happens if…** an attacker can modify your signaling messages in transit (plain `ws://`, no auth)? DTLS encrypts the media, so why does this matter?
+
+   <details><summary>Answer</summary>
+
+   The SDP carries the `a=fingerprint` of each side's DTLS certificate, and DTLS only checks that the peer's certificate matches the fingerprint *it received through signaling*. An attacker who can rewrite signaling can swap in their own fingerprint and ICE candidates and sit in the middle, decrypting and re-encrypting everything. The encryption is only as trustworthy as the signaling channel, so use `wss://` plus authentication (ch.6).
+   </details>
+
+5. **Do the math.** Five people are in a mesh call, each sending 720p video at about 1.5 Mbit/s. How many PeerConnections does each browser hold, what is each browser's video uplink, and how many video encoders is each laptop running? What would the uplink be with an SFU?
+
+   <details><summary>Answer</summary>
+
+   Each browser holds N − 1 = **4** PeerConnections, uploads 4 × 1.5 = **6 Mbit/s** of video and runs **4** encoders. Across the network that is 5 × 4 = 20 video streams. With an SFU each browser uploads its video **once** (about 1.5 Mbit/s, a bit more with simulcast) and the server forwards the copies. That is where Chapter 11 starts.
+   </details>
+
 ## Key takeaways
 
 - WebSockets carry **signaling**: small, reliable, ordered JSON. WebRTC carries **media** over UDP with real-time congestion control and mandatory DTLS-SRTP encryption.
@@ -911,5 +955,23 @@ try {
 - **Perfect negotiation** (polite/impolite, `makingOffer`, `ignoreOffer`, implicit rollback) makes renegotiation safe from both sides with identical code.
 - Data channels are P2P, configurable-reliability sockets. Keep server-visible state on the WebSocket.
 - Mesh costs **O(N) uplink and O(N) encoders per client** and falls apart at about 4 peers. The answer is an SFU.
+
+---
+
+## Before chapter 11
+
+Chapter 11 replaces the mesh with a server that forwards media: an [SFU](glossary.md#sfu). It is the steepest chapter in the course, so check that the ideas below feel solid first. For each one you should be able to explain it out loud to a colleague in two or three sentences.
+
+- [ ] **Signaling vs media.** The WebSocket carries small JSON "notes". Audio and video travel on a separate, UDP-based, encrypted path. (§1)
+- [ ] **One `RTCPeerConnection` = one encrypted session to one other endpoint.** Tracks you add become senders, and tracks you receive arrive in the `track` event. (§2.2)
+- [ ] **SDP offer/answer is the "what".** It lists codecs, media sections, ICE credentials and the DTLS fingerprint. You relay it as an opaque blob. (§2.3)
+- [ ] **ICE candidates are the "where".** You know `host` vs `srflx` vs `relay`, and why candidates *trickle* in as separate messages. (§2.4)
+- [ ] **STUN vs TURN.** STUN tells you your public address. TURN relays your media when nothing else works. (§2.5)
+- [ ] **DTLS fingerprints tie the media encryption to the signaling**, which is why signaling must be `wss://` and authenticated. (§2.6)
+- [ ] **The mesh math.** Each client pays O(N) uplink and O(N) encoders, which is why mesh stops at about 4 peers. (§4)
+- [ ] **Request/response over a WebSocket** (ch.4 envelope: `id` + `replyTo`), wrapped in a promise-returning `request(type, payload)` helper. Chapter 11 uses it for *every* step.
+- [ ] **Callbacks as a "reply later" handle.** You're comfortable with an event handler that receives `callback`/`errback` functions and must call exactly one of them when an async operation finishes.
+
+**Good news: what you can let go of.** In chapter 11 you will *not* write offers, answers or perfect negotiation yourself. The `mediasoup-client` library generates and applies all the SDP inside the browser. Knowing what it does for you (this chapter) is what lets you debug it when it goes wrong.
 
 Next → [Chapter 11 — mediasoup: Building an SFU](./11-mediasoup.md)

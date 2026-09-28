@@ -6,6 +6,8 @@
 
 > Prerequisites: [Chapter 3 — Express integration](./03-express-integration.md) (sharing one `http.Server`), [Chapter 4 — Messaging patterns](./04-messaging-patterns.md) (envelope, request/response, rooms), [Chapter 5 — Reliability](./05-reliability.md) (heartbeats, reconnect, replay).
 
+> **In plain English:** If a raw WebSocket is a phone line, Socket.IO is a whole call-centre system built on top of it: named call types (events), "call me back with the answer" (acks), conference rooms, automatic redialling, and a fallback to passing notes (HTTP long-polling) when the line won't connect. It's very convenient, but it speaks its own language, so both ends must use a Socket.IO library and a plain `new WebSocket()` can't join. Almost everything it offers is a polished version of what you built by hand in chapters 4 and 5, including [namespaces](glossary.md#namespace) and a pluggable [adapter](glossary.md#adapter) for scaling.
+
 ---
 
 ## 1. Socket.IO is *not* a WebSocket implementation
@@ -970,6 +972,63 @@ Many large systems use **both**: Socket.IO for the browser app, raw WebSocket fo
 - Ex. 3: with `skipMiddlewares: true`, `io.use()` does not run on recovery, so an expired token keeps working. Either set it to `false` or store `exp` in `socket.data` and check it in a `socket.use()` middleware.
 - Ex. 4: return `history.filter(m => m.seq > lastSeen)` in the ack; dedupe on the client by `id` in case recovery and history overlap.
 - Ex. 5: a volatile event looks identical on the wire (`42[...]`) — "volatile" is a server-side decision about *whether* to write, not a packet flag.
+
+</details>
+
+---
+
+## Check your understanding
+
+1. A teammate's browser code does `new WebSocket('ws://localhost:3000/socket.io/?EIO=4&transport=websocket')` against your Socket.IO server and then sends `JSON.stringify({ type: 'chat:message', text: 'hi' })`. Why does this not work?
+
+<details><summary>Answer</summary>
+
+Socket.IO is **not** a WebSocket server. It is its own protocol (Engine.IO packets carrying Socket.IO packets) that happens to run *over* WebSocket or HTTP long-polling. A plain WebSocket might get as far as the transport, but it doesn't speak the handshake or the `4`/`42[...]` packet format, so the server closes it or ignores it. Use `socket.io-client` on the other end, or use raw `ws` on the server if you need plain-WebSocket clients. See §1 and pitfall 1.
+
+</details>
+
+2. Decode these two frames from DevTools: `421["room:join","general"]` and `431[{"ok":true}]`.
+
+<details><summary>Answer</summary>
+
+`4` = Engine.IO *message*; `2` = Socket.IO *EVENT*; `1` = ack id 1; then the event name `room:join` with argument `"general"`. The reply `431[...]` is: Engine.IO message (`4`), Socket.IO *ACK* (`3`), for ack id `1`, with argument `{ ok: true }`. It is the `id`/`replyTo` pair from Chapter 4, packed tighter. See §1.1 and §5.
+
+</details>
+
+3. Spot the problems in this acknowledgement code:
+
+   ```js
+   // server
+   socket.on('room:join', (room, ack) => {
+     socket.join(room);
+     ack({ ok: true });
+   });
+   // client
+   const res = await socket.emitWithAck('room:join', 'general');
+   ```
+
+<details><summary>Answer</summary>
+
+- **Server:** it calls `ack` without checking `typeof ack === 'function'`. A malicious client can send the event without an ack id, and `undefined()` throws in your handler. It also joins **any** room name without validation or authorization, and rooms are your authorization boundary.
+- **Client:** there's no `timeout()`. If the server never answers (or the connection drops), the promise can wait forever. Use `await socket.timeout(3000).emitWithAck(...)` inside `try/catch`.
+
+See §5, "Ack rules", and §6.
+
+</details>
+
+4. You're adding an admin console with a different login requirement, plus one chat channel per project. Which should be a **namespace** and which a **room**, and why?
+
+<details><summary>Answer</summary>
+
+The admin console should be a **namespace** (`io.of('/admin')`). Namespaces are static, chosen by the client, and each has its own middleware, so it can have its own auth, while still sharing the same underlying connection. Per-project channels should be **rooms**. Rooms are dynamic and assigned by the server (the client can only *ask* to join), which makes them the right place for authorization. Rule of thumb: *namespaces are static and client-chosen; rooms are dynamic and server-assigned*. See §7.1 and §6.
+
+</details>
+
+5. Connection state recovery is enabled. During a 10-second network drop the server sends one user a private notice with `socket.emit('notice', …)` and broadcasts `io.to('general').emit('chat:message', …)`. After the client reconnects, which of these does it receive, and when would it receive **neither**?
+
+<details><summary>Answer</summary>
+
+Only the **broadcast** to `general` is replayed. Recovery buffers only broadcasts, which get offsets. A direct `socket.emit()` is not stored (send it as `io.to(socket.id).emit(...)` if it must survive). The client gets **neither** if recovery fails: the drop lasted longer than `maxDisconnectionDuration`, the server restarted, the disconnect was deliberate (`socket.disconnect()`), the adapter doesn't support recovery, or the client had not yet received any broadcast offset. Then `socket.recovered === false` and you need a resync-from-database path. See §9.
 
 </details>
 

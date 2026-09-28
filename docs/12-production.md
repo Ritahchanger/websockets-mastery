@@ -4,6 +4,8 @@
 
 **What you'll learn.** A WebSocket app and an SFU fail in production in different ways. WebSockets break at proxies, load balancers and idle timeouts. mediasoup breaks at **NAT, firewalls and UDP**, usually silently: signaling works, the UI says "connected", and every tile is black. This chapter is the deployment guide for both. It covers TLS and secure contexts (Let's Encrypt), nginx/Caddy for `wss://`, UDP port ranges and firewalls, `announcedAddress` on cloud VMs, TURN for locked-down networks, Docker networking (why mediasoup wants `network_mode: host`), process management with systemd or PM2, **horizontal scaling of the SFU** (room → server assignment, pipe transports across hosts), monitoring (connections, worker CPU, `died` handling), and capacity planning. It ends with a production checklist, a mastery checklist for the whole course, and where to go next. All config files shown here are also in `examples/12-production/`.
 
+> **In plain English:** Your app sends two kinds of traffic, and in production they take **different roads**. The WebSocket (signaling) and the web page go through a reverse proxy on port 443, like any website. The audio and video go **straight to the media server** over UDP, on a range of ports, bypassing the proxy. Almost every "it worked on my laptop" failure comes from that second road being blocked by a firewall, or pointed at the wrong address. This chapter covers opening both roads (TLS, proxy, ports, `announcedAddress`, TURN), keeping the processes alive (Docker, systemd, PM2, graceful restarts), adding more servers when one isn't enough, and watching the gauges so you know when something breaks.
+
 ---
 
 ## 1. The production topology
@@ -387,6 +389,8 @@ Give every media node **its own public hostname** (`m-3.example.com`) with a TLS
 
 ### 7.2 Rooms bigger than one host: pipe transports across hosts
 
+> 🔬 **Deep dive — optional on first read.** Cross-host cascading is only needed for very large rooms (hundreds to thousands of participants). Most deployments stop at §7.1: one room per node.
+
 A 1 000-viewer webinar or a 300-person all-hands does not fit on one box. In **cascading**, the room spans hosts: producers live on an origin node, and each edge node gets **one** copy of each producer over a `PipeTransport` and fans it out locally.
 
 ```mermaid
@@ -537,6 +541,8 @@ Worked example: 50 rooms × 8 participants, cam + mic, simulcast, 720p max, a gr
 
 Two levers do most of the work: **downscale the layers viewers receive** (thumbnails at 180p) and **pause off-screen consumers**. Together they often cut egress by 3–5×.
 
+> 🔬 **Deep dive — optional on first read.** Kernel tuning and load-test tooling matter once you are pushing real traffic. Skip them until you are load testing.
+
 Tune the kernel for many UDP flows:
 
 ```bash
@@ -613,6 +619,43 @@ To load test, use a headless Chrome farm (Puppeteer/Playwright with `--use-fake-
 - (4) Use different `NODE_ID`s. Node B asks A with `{ producerId, ip, port, srtpParameters }` and A replies with its tuple + `rtpParameters`.
 - (5) Chrome flags: `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream --autoplay-policy=no-user-gesture-required`. Each headless tab costs about 1 core, so spread bots across machines.
 </details>
+
+## Check your understanding
+
+1. **Conceptual.** Why can't you just put nginx or Caddy in front of mediasoup and let it handle *all* the traffic, as you do for the WebSocket?
+
+   <details><summary>Answer</summary>
+
+   Reverse proxies understand HTTP and WebSocket (TCP). WebRTC media is SRTP over UDP, going to whatever IP:port mediasoup put in its ICE candidates, and nginx/Caddy can't proxy it. So the proxy carries only HTTPS + WSS, and the media goes **directly** to the VM's public IP on the open UDP (and fallback TCP) port range.
+   </details>
+
+2. **What happens if…** nginx keeps its default `proxy_read_timeout` of 60 s and your app sends heartbeats every 90 s?
+
+   <details><summary>Answer</summary>
+
+   nginx sees no traffic on the upgraded connection for 60 s and closes it, so every idle client is disconnected about once a minute and has to reconnect (and, for media, rebuild its transports). Set the proxy timeout **longer than** the heartbeat interval, e.g. heartbeats every 25–30 s with a timeout of a few minutes.
+   </details>
+
+3. **What happens if…** you run the SFU under PM2 in **cluster** mode with 4 instances?
+
+   <details><summary>Answer</summary>
+
+   PM2 spreads incoming connections across 4 separate Node processes, and each one has its own mediasoup workers and routers. Alice's WebSocket may land in process 1 and Bob's in process 3, so they join *different* routers with the same room name and can't see or hear each other. Use **fork** mode (one process that starts one worker per core), or explicit room → process assignment.
+   </details>
+
+4. **Read the code.** In §8.2's `watchWorker`, why does the `died` handler call `watchWorker(workers[index], index)` on the new worker, and why does it send `mediaReset` to peers instead of recreating their transports on the server?
+
+   <details><summary>Answer</summary>
+
+   The listener was attached to the *old* worker object. Without calling `watchWorker` again, a second crash of the replacement worker would go unnoticed and its rooms would silently stop forwarding. Server-side transports can't simply be recreated behind the client's back, because each one is paired with a browser-side transport (ICE/DTLS state, ids, producers). So the client is told to throw away both transports and re-run load → transports → produce/consume over its *existing* WebSocket. That is the same recovery path as an unrecoverable network change.
+   </details>
+
+5. **Do the math.** You expect 20 rooms × 6 participants, camera + mic, with viewers receiving a ~500 kbit/s video layer. Roughly how many video consumers, CPU cores and Gbit/s of egress is that?
+
+   <details><summary>Answer</summary>
+
+   Video consumers: 20 × 6 × 5 = **600** (plus 600 cheap audio consumers). At ~500 per core that is about **1.2 cores**, so 2 workers with plenty of headroom. Egress: 600 × 0.5 Mbit/s + 600 × 0.04 Mbit/s ≈ **0.32 Gbit/s** sustained. Check your NIC and your cloud egress bill: bandwidth, not CPU, is usually the real limit.
+   </details>
 
 ## Key takeaways
 

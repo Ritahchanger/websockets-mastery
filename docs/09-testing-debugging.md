@@ -6,6 +6,8 @@
 
 > Prerequisites: the envelope protocol and rooms from [Chapter 4](./04-messaging-patterns.md), heartbeats from [Chapter 5](./05-reliability.md), `noServer` + `upgrade` from [Chapter 3](./03-express-integration.md). Socket.IO basics from [Chapter 7](./07-socketio.md) help for §6.
 
+> **In plain English:** Testing a WebSocket server is less like testing a vending machine (coin in, snack out) and more like testing a group chat. Messages go to *other* people, they arrive in any order, and sometimes the correct result is that nothing happens at all. The trick is to run the real server on a random port, give every test client an "inbox" that catches each message from the very first moment, and always wait with a timeout instead of sleeping. When something breaks in production, you look at the wire (DevTools, `wscat`, `curl`) and at the numbers (logs with close codes, metrics).
+
 ---
 
 ## 1. Why WebSocket code is hard to test (and why that's fixable)
@@ -1095,6 +1097,56 @@ Expected test output ends with:
 - (3) Histograms are cumulative: each `le` bucket counts all observations ≤ its bound, plus a `le="+Inf"` bucket equal to `_count`. Time handlers with `process.hrtime.bigint()`.
 - (4) Pass headers via the client options: `connect(url, { headers: { Origin: '…' } })`. In the `upgrade` handler, write `HTTP/1.1 403 Forbidden` before `socket.destroy()`.
 - (5) `websocat -n1` exits non-zero if the handshake fails; `curl -i` through the proxy shows whether you get `101`.
+
+</details>
+
+---
+
+## Check your understanding
+
+1. This test sometimes hangs forever against a server that sends `hello` as soon as a client connects. Why?
+
+   ```js
+   const ws = new WebSocket(url);
+   await new Promise((r) => ws.once('open', r));
+   const hello = await new Promise((r) => ws.once('message', (d) => r(JSON.parse(d))));
+   ```
+
+<details><summary>Answer</summary>
+
+The `message` listener is attached *after* `open`. If `hello` arrives before that line runs, the event has already fired and is lost, so the promise waits forever (there is no timeout either). `once('message')` also resolves with *whatever* comes next, which may not be the message you wanted. Attach an **inbox** synchronously when you create the socket, then pull from it with `nextMessage(ws, predicate, timeout)`. See §3.1.
+
+</details>
+
+2. Why does the example export a `createApp()` factory and call `listen(0)` in tests, instead of having `server.js` call `app.listen(3000)` when imported?
+
+<details><summary>Answer</summary>
+
+Port **0** makes the OS pick a free port, so test files can run in parallel and never collide with each other or with your dev server on 3000 (no `EADDRINUSE`). A factory that doesn't listen at import time lets each test create its own **isolated** instance, with injected settings (`heartbeatMs: 50`, a small `maxPayload`, a silent logger), and tear it down with `close()`. That avoids flakes from shared room state. See §1 and §2.
+
+</details>
+
+3. All tests pass, but `node --test` never exits. Name three likely culprits.
+
+<details><summary>Answer</summary>
+
+Any of: an un-cleared or un-`unref()`ed `setInterval` (the heartbeat sweep or a metrics flush); client sockets that were never closed; relying on `wss.close()`, which in `ws@8` does **not** close existing clients (`terminate()` them first); `server.close()` waiting on keep-alive sockets left by `fetch` (use `server.closeAllConnections()`); a Socket.IO server that wasn't `await io.close()`d. Diagnose with `--test-timeout` or `why-is-node-running`. See §4.6.
+
+</details>
+
+4. How do you write a reliable test that Carol, who is in room `random`, does **not** receive a message sent to `general`?
+
+<details><summary>Answer</summary>
+
+You can't `await` something that never happens, so use a time-bounded negative check: send the triggering message **first**, then `expectSilence(carol, predicate, 100)`, which fails if a matching message arrives within the window. Make it stronger by pairing it with a positive in the same test: wait until Bob in `general` **did** receive it. That proves the server processed the broadcast before the silence window closed. See §3.3.
+
+</details>
+
+5. Users report that idle connections drop after almost exactly 60 seconds, with close code `1006`, only in production. What's the most likely cause, and how do you confirm and fix it?
+
+<details><summary>Answer</summary>
+
+A **proxy or load-balancer idle timeout**. nginx's default `proxy_read_timeout` is 60 s and AWS ALB's idle timeout is also 60 s. `1006` means no close frame was received: the TCP connection was just cut, and the suspiciously round duration is the signature. Confirm by checking close codes and durations in your structured `close` logs. Fix it by sending heartbeats well within the shortest timeout on the path (e.g. every 25–30 s) and/or raising the proxy timeout. See §9, "`1006 Abnormal Closure`", and §8.1.
 
 </details>
 
