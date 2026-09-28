@@ -1,0 +1,37 @@
+<!doctype html>
+<!-- examples/10-webrtc-p2p/public/index.html -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ch.10 — WebRTC P2P mesh</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
+    header { display: flex; gap: .5rem; align-items: center; padding: .75rem 1rem; background: #1b1b1b; flex-wrap: wrap; }
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: .5rem; padding: .5rem; }
+    figure { margin: 0; position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 16/9; }
+    video { width: 100%; height: 100%; object-fit: cover; }
+    figcaption { position: absolute; left: .5rem; bottom: .5rem; background: #0009; padding: .1rem .4rem; border-radius: 4px; font-size: .8rem; }
+    #chat { padding: .5rem 1rem; font-size: .9rem; }
+    #log { height: 7rem; overflow: auto; background: #1b1b1b; padding: .5rem; border-radius: 6px; }
+    button, input { font: inherit; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Room:</strong> <span id="room"></span>
+    <button id="join">Join call</button>
+    <button id="mic" disabled>Mute mic</button>
+    <button id="cam" disabled>Stop cam</button>
+    <span id="status">idle</span>
+  </header>
+  <main id="grid">
+    <figure><video id="local" autoplay playsinline muted></video><figcaption>you</figcaption></figure>
+  </main>
+  <section id="chat">
+    <div id="log"></div>
+    <form id="chat-form"><input id="chat-input" placeholder="data-channel chat (P2P, not via server)" size="40" /> <button>Send</button></form>
+  </section>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

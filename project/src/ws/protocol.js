@@ -4,8 +4,9 @@
 //
 // * Client -> server frames are validated twice: envelope first, then the
 //   payload against the schema registered for its `type`.
-// * A request is answered with `type: "reply"` (success) or `type: "error"`,
-//   carrying `replyTo: <request id>` so the client can resolve its promise.
+// * A request is answered with `type: "ok"` (success) or `type: "error"`
+//   (the ch.4 convention), carrying `replyTo: <request id>` so the client
+//   can resolve or reject the matching promise.
 // * Server -> client pushes ("events") have no replyTo.
 import crypto from 'node:crypto';
 import { z } from 'zod';
@@ -128,5 +129,5 @@ export const newId = () => crypto.randomUUID();
 
 /** Build an outbound envelope. */
 export const envelope = (type, payload = {}, replyTo) => (replyTo ? { type, id: newId(), payload, replyTo } : { type, id: newId(), payload });
-export const reply = (requestId, payload = {}) => envelope('reply', payload, requestId);
+export const reply = (requestId, payload = {}) => envelope('ok', payload, requestId);
 export const errorReply = (requestId, code, message) => envelope('error', { code, message }, requestId);

@@ -1,18 +1,4 @@
-// Chapter 10 — WebRTC P2P signaling server.
-//
-// The server NEVER touches media. It only relays three kinds of opaque blobs
-// between peers of the same room: SDP descriptions, ICE candidates, and
-// presence (joined / left). Media flows browser <-> browser over UDP.
-//
-// Envelope (same as ch.4): { type, id, payload, replyTo? }
-//   client -> server  room:join  { room, name }            (request, gets a reply)
-//   server -> client  room:joined{ selfId, peers:[{id,name}] }  (replyTo = join id)
-//   server -> others  peer:joined{ id, name }
-//   client -> server  signal     { to, data }               data = {description} | {candidate}
-//   server -> client  signal     { from, data }
-//   server -> others  peer:left  { id }
-//   server -> client  error      { code, message }
-
+// examples/10-webrtc-p2p/server.js
 import http from 'node:http';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -22,14 +8,13 @@ import { WebSocketServer } from 'ws';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3000);
-const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS ?? 4); // mesh ceiling, see chapter text
+const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS ?? 4); // mesh ceiling (section 4)
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ICE servers are served by the backend so you can rotate TURN credentials
-// without redeploying the client. In production, mint short-lived TURN
-// credentials here (coturn `use-auth-secret`, see docs/10 and docs/12).
+// ICE servers come from the backend so TURN credentials can rotate without
+// redeploying the client. In production, mint them per user with turnCredentials().
 app.get('/config', (_req, res) => {
   const iceServers = [{ urls: process.env.STUN_URL ?? 'stun:stun.l.google.com:19302' }];
   if (process.env.TURN_URL) {
@@ -48,10 +33,11 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 }); // S
 server.on('upgrade', (req, socket, head) => {
   const { pathname } = new URL(req.url, 'http://localhost');
   if (pathname !== '/ws') return socket.destroy();
+  // In production: authenticate here (ch.6) — a forged signaling peer can MITM via fingerprints.
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
-/** @type {Map<string, Map<string, {ws: import('ws').WebSocket, name: string}>>} */
+/** room name -> Map(peerId -> { ws, name }) */
 const rooms = new Map();
 
 const send = (ws, type, payload, replyTo) => {
@@ -60,7 +46,7 @@ const send = (ws, type, payload, replyTo) => {
 };
 
 wss.on('connection', (ws) => {
-  const peerId = randomUUID();
+  const peerId = randomUUID();   // server-assigned: clients can't spoof "from"
   let roomName = null;
 
   ws.isAlive = true;

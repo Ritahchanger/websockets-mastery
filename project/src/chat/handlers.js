@@ -1,6 +1,7 @@
 // Chat feature: channels, messages, history, reactions, typing, presence.
 // Each handler is small because validation already happened in the gateway
 // and error formatting happens in the router.
+import crypto from 'node:crypto';
 import { ChannelStore } from './channels.js';
 import { TypingTracker } from './typing.js';
 import { wirePresence } from './presence.js';
@@ -8,6 +9,9 @@ import { ProtocolError } from '../ws/protocol.js';
 
 export function registerChat({ router, hub, config, getHuddles = () => [] }) {
   const channels = new ChannelStore(config.chat);
+  // Identifies this server's in-memory history. If it changes between two
+  // welcomes, the server restarted: seq cursors are meaningless, refetch all.
+  const epoch = crypto.randomUUID().slice(0, 8);
   const presence = wirePresence(hub);
   const toMembers = (channel) => (c) => channel.members.has(c);
 
@@ -27,7 +31,7 @@ export function registerChat({ router, hub, config, getHuddles = () => [] }) {
 
   // First frame on every connection: who you are + the world as of now.
   hub.on('connect', (client) => {
-    client.event('session:welcome', { user: client.user, clientId: client.id, serverTime: Date.now(), ...snapshot() });
+    client.event('session:welcome', { user: client.user, clientId: client.id, epoch, serverTime: Date.now(), ...snapshot() });
   });
 
   hub.on('disconnect', (client, { lastForUser }) => {

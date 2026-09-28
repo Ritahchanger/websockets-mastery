@@ -698,7 +698,8 @@ function handleConnection(socket, head) {
   function onMessage(opcode, payload) {
     if (opcode === OP.TEXT) {
       const text = payload.toString('utf8');
-      console.log(`[message] text: ${JSON.stringify(text)}`);
+      const preview = text.length > 60 ? `${text.slice(0, 60)}... (${text.length} chars)` : text;
+      console.log(`[message] text: ${JSON.stringify(preview)}`);
       socket.write(encodeFrame(OP.TEXT, Buffer.from(`echo: ${text}`, 'utf8')));
     } else {
       console.log(`[message] binary: ${payload.length} bytes`);

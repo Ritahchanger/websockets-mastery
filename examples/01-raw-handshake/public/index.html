@@ -1,0 +1,79 @@
+<!-- examples/01-raw-handshake/public/index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Raw WebSocket echo</title>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    #log { background: #111; color: #9f9; font: 13px/1.4 ui-monospace, monospace; padding: 1rem;
+           height: 320px; overflow-y: auto; border-radius: 8px; white-space: pre-wrap; }
+    .row { display: flex; gap: .5rem; margin: .75rem 0; flex-wrap: wrap; }
+    input { flex: 1; padding: .5rem; min-width: 12rem; }
+    button { padding: .5rem .9rem; cursor: pointer; }
+    #state { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Raw WebSocket echo</h1>
+  <p>State: <span id="state">-</span></p>
+  <div class="row">
+    <input id="text" placeholder="Type a message" value="Hi" />
+    <button id="send">Send text</button>
+    <button id="bin">Send binary [1,2,3]</button>
+    <button id="big">Send 70 KB (64-bit length)</button>
+  </div>
+  <div class="row">
+    <button id="close">Close (1000)</button>
+    <button id="reconnect">Reconnect</button>
+  </div>
+  <div id="log"></div>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const log = (msg) => { $('log').textContent += msg + '\n'; $('log').scrollTop = 1e9; };
+    const STATES = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+    let ws;
+
+    function connect() {
+      // Same host/port as the page. Offer one subprotocol the server knows.
+      ws = new WebSocket(`ws://${location.host}/`, ['echo.v1']);
+      ws.binaryType = 'arraybuffer'; // binary messages arrive as ArrayBuffer, not Blob
+      $('state').textContent = STATES[ws.readyState];
+
+      ws.onopen = () => {
+        $('state').textContent = STATES[ws.readyState];
+        log(`open (protocol="${ws.protocol}", extensions="${ws.extensions}")`);
+      };
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          log(`< text: ${e.data.length > 80 ? e.data.slice(0, 80) + '...' : e.data}`);
+        } else {
+          log(`< binary: [${[...new Uint8Array(e.data)].slice(0, 16).join(',')}] (${e.data.byteLength} bytes)`);
+        }
+      };
+      ws.onerror = () => log('error (details are hidden from JS; see close event)');
+      ws.onclose = (e) => {
+        $('state').textContent = STATES[ws.readyState];
+        log(`close code=${e.code} reason="${e.reason}" wasClean=${e.wasClean}`);
+      };
+    }
+
+    function send(data) {
+      if (ws.readyState !== WebSocket.OPEN) return log('! not open');
+      ws.send(data);
+      log(`> sent (bufferedAmount=${ws.bufferedAmount})`);
+    }
+
+    $('send').onclick = () => send($('text').value);
+    $('bin').onclick = () => send(new Uint8Array([1, 2, 3]));
+    $('big').onclick = () => send('x'.repeat(70_000)); // > 65535 => 127 + 64-bit length
+    $('close').onclick = () => ws.close(1000, 'user clicked close');
+    $('reconnect').onclick = () => { if (ws.readyState === WebSocket.CLOSED) connect(); };
+    $('text').onkeydown = (e) => { if (e.key === 'Enter') $('send').click(); };
+
+    connect();
+  </script>
+</body>
+</html>

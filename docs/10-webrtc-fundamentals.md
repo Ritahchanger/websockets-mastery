@@ -497,8 +497,8 @@ Design notes:
 ### 5.3 The page
 
 ```html
-<!-- examples/10-webrtc-p2p/public/index.html -->
 <!doctype html>
+<!-- examples/10-webrtc-p2p/public/index.html -->
 <html lang="en">
 <head>
   <meta charset="utf-8" />

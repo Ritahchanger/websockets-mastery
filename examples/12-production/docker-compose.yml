@@ -1,0 +1,31 @@
+# examples/12-production/docker-compose.yml
+services:
+  sfu:
+    build:
+      context: ../11-mediasoup-minimal   # add a .dockerignore with node_modules/ there
+      dockerfile: ../12-production/Dockerfile
+    network_mode: host                 # ← no port publishing, no docker-proxy, no extra NAT
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      MEDIASOUP_NUM_WORKERS: "4"
+      MEDIASOUP_LISTEN_IP: "0.0.0.0"
+      MEDIASOUP_ANNOUNCED_ADDRESS: "${PUBLIC_IP:?set PUBLIC_IP}"
+      MEDIASOUP_MIN_PORT: "40000"
+      MEDIASOUP_MAX_PORT: "49999"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    stop_grace_period: 60s             # time to drain rooms on SIGTERM (§6.3)
+
+  coturn:
+    image: coturn/coturn:4.6
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["127.0.0.1:6379:6379"]

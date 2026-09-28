@@ -1,0 +1,14 @@
+# examples/12-production/Caddyfile
+app.example.com {
+	encode zstd gzip
+
+	# WebSocket signaling — Caddy handles Upgrade automatically; just don't buffer/timeout it.
+	@ws path /ws
+	reverse_proxy @ws 127.0.0.1:3000 {
+		stream_timeout 24h          # max lifetime of a WS connection
+		stream_close_delay 5m       # on config reload, keep old WS alive for 5 min (no mass reconnect)
+	}
+
+	reverse_proxy 127.0.0.1:3000
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}

@@ -1113,4 +1113,4 @@ Expected test output ends with:
 
 ---
 
-Next → [Chapter 10 — WebRTC fundamentals (P2P)](./10-webrtc-p2p.md)
+Next → [Chapter 10 — WebRTC fundamentals (P2P)](./10-webrtc-fundamentals.md)

@@ -661,7 +661,9 @@ Things to notice:
 
   // 3. Feed: fetch a 60-second token, pass it as a subprotocol entry.
   async function connectFeed(badToken = false) {
-    const { token } = await (await fetch('/api/token')).json();
+    const res = await fetch('/api/token');
+    if (!res.ok) return add('feedLog', `no token: HTTP ${res.status}`, 'muted');
+    const { token } = await res.json();
     const t = badToken ? token.slice(0, -3) + 'xxx' : token;
     const ws = new WebSocket(`${wsBase}/ws/feed`, ['feed.v1', `auth.${t}`]);
     if (!badToken) feed = ws;

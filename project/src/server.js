@@ -77,7 +77,11 @@ export async function createHuddleServer(overrides = {}) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const huddle = await createHuddleServer();
   const addr = await huddle.listen();
-  logger.info(`Huddle listening on http://localhost:${addr.port}`, { media: huddle.media.available });
+  logger.info(`Huddle listening on http://localhost:${addr.port}`, {
+    media: huddle.media.available,
+    announcedIp: huddle.config.media.announcedIp,
+    rtcPorts: `${huddle.config.media.rtcMinPort}-${huddle.config.media.rtcMaxPort}`,
+  });
 
   let stopping = false;
   const shutdown = async (signal) => {

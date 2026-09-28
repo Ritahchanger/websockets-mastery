@@ -8,6 +8,7 @@
   "scripts": {
     "build:client": "esbuild public/src/client.js --bundle --format=esm --target=es2020 --sourcemap --outfile=public/bundle.js",
     "start": "node server.js",
+    "test": "node test-signaling.js",
     "dev": "npm run build:client && npm start"
   },
   "dependencies": {

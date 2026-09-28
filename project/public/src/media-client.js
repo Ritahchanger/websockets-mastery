@@ -25,9 +25,15 @@ export class HuddleMedia extends EventTarget {
   #unsubs = [];
   #ready = null; // resolves when recv transport exists (consumes wait on it)
 
-  constructor(socket) {
+  /**
+   * @param {HuddleSocket} socket
+   * @param {{ createDevice?: () => Device }} [opts] tests inject a Device
+   *   built on mediasoup-client's FakeHandler so this runs in Node.
+   */
+  constructor(socket, { createDevice = () => new Device() } = {}) {
     super();
     this.socket = socket;
+    this.createDevice = createDevice;
   }
 
   #emit(type, detail) {
@@ -63,7 +69,7 @@ export class HuddleMedia extends EventTarget {
     try {
       // 1. What codecs does the router speak?  2. Load the device with them.
       const { rtpCapabilities } = await s.request('media:getRouterRtpCapabilities', { roomId });
-      this.device = new Device();
+      this.device = this.createDevice();
       await this.device.load({ routerRtpCapabilities: rtpCapabilities });
 
       // 3. Join, telling the server what *we* can receive.
@@ -150,7 +156,8 @@ export class HuddleMedia extends EventTarget {
 
   // ---- local media -------------------------------------------------------
 
-  async #produce(source, track, options = {}) {
+  /** Publish a track. `source` tells receivers where to render it. */
+  async produce(source, track, options = {}) {
     const producer = await this.sendTransport.produce({ track, appData: { source }, ...options });
     this.producers.set(source, producer);
     producer.on('trackended', () => this.stop(source)); // e.g. "Stop sharing" browser button
@@ -163,19 +170,19 @@ export class HuddleMedia extends EventTarget {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    await this.#produce('mic', stream.getAudioTracks()[0], { codecOptions: { opusStereo: false, opusDtx: true } });
+    await this.produce('mic', stream.getAudioTracks()[0], { codecOptions: { opusStereo: false, opusDtx: true } });
   }
 
   async startCam() {
     if (this.producers.has('cam')) return;
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
-    await this.#produce('cam', stream.getVideoTracks()[0], { encodings: CAM_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 1000 } });
+    await this.produce('cam', stream.getVideoTracks()[0], { encodings: CAM_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 1000 } });
   }
 
   async startScreen() {
     if (this.producers.has('screen')) return;
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 30 } }, audio: false });
-    await this.#produce('screen', stream.getVideoTracks()[0]);
+    await this.produce('screen', stream.getVideoTracks()[0]);
   }
 
   /** Mute = pause (instant, keeps the mic open). Server pauses forwarding too. */

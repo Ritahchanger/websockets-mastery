@@ -1,0 +1,25 @@
+# examples/12-production/huddle-sfu.service   → /etc/systemd/system/huddle-sfu.service
+[Unit]
+Description=Huddle SFU (Node + mediasoup)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=huddle
+WorkingDirectory=/opt/huddle
+EnvironmentFile=/etc/huddle/env           # MEDIASOUP_ANNOUNCED_ADDRESS=..., TURN_SECRET=...
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=60                          # graceful drain window
+LimitNOFILE=65536                          # each WS + each RTC socket is an fd
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/huddle/recordings
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

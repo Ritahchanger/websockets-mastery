@@ -4,7 +4,7 @@
 
 **What you'll learn.** A WebSocket that works on your laptop is easy. A WebSocket that keeps working on a train going through a tunnel, behind a corporate proxy that kills idle connections after 60 seconds, across a server deploy, and with one client on a 2G phone that can't keep up is hard. In this chapter you'll learn to detect dead connections with heartbeats (and why TCP keepalive doesn't do it for you), reconnect clients with exponential backoff and jitter, resume sessions without losing messages using sequence numbers and a replay buffer, handle slow consumers with backpressure, get at-least-once delivery with acks and idempotency, and shut a server down gracefully with close code `1001`. By the end you'll have one server and one browser client that show all of these together.
 
-> Prerequisites: [Chapter 2](./02-ws-basics.md) (the `ws` API), [Chapter 3](./03-express-integration.md) (Express + `noServer` + the `upgrade` event), and [Chapter 4](./04-messaging-patterns.md) (the `{ type, id, payload, replyTo }` envelope and zod validation). Everything here builds on that protocol.
+> Prerequisites: [Chapter 2](./02-first-server-ws.md) (the `ws` API), [Chapter 3](./03-express-integration.md) (Express + `noServer` + the `upgrade` event), and [Chapter 4](./04-messaging-patterns.md) (the `{ type, id, payload, replyTo }` envelope and zod validation). Everything here builds on that protocol.
 
 ---
 

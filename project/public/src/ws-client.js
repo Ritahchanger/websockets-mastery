@@ -195,6 +195,7 @@ export class HuddleSocket extends EventTarget {
     this.#emit('reconnecting', { attempt: this.#attempt, delay, at: Date.now() + delay });
     clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = setTimeout(() => this.#open(), delay);
+    this.#reconnectTimer.unref?.(); // Node (tests/CLI): don't keep the process alive
   }
 
   #failPending(code, message) {
@@ -223,6 +224,7 @@ export class HuddleSocket extends EventTarget {
     };
     ping();
     this.#pingTimer = setInterval(ping, this.pingIntervalMs);
+    this.#pingTimer.unref?.();
   }
 
   #stopPing() {

@@ -39,7 +39,7 @@ npm run ex:02        # run any chapter example, then open http://localhost:3000
 | 9 | [Testing & debugging](docs/09-testing-debugging.md) | Advanced | `examples/09-testing` |
 | 10 | [WebRTC fundamentals: signaling over WebSockets](docs/10-webrtc-fundamentals.md) | Advanced | `examples/10-webrtc-p2p` |
 | 11 | [mediasoup: building an SFU](docs/11-mediasoup.md) | Expert | `examples/11-mediasoup-minimal` |
-| 12 | [Production: TLS, TURN, deployment, monitoring](docs/12-production.md) | Expert | — |
+| 12 | [Production: TLS, TURN, deployment, monitoring](docs/12-production.md) | Expert | `examples/12-production` — nginx/Caddy, coturn, Docker, systemd/PM2 configs |
 | 13 | [Capstone: building Huddle](docs/13-capstone-huddle.md) | Expert | `project/` |
 
 ## How to study

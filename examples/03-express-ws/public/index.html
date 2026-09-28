@@ -1,0 +1,159 @@
+<!-- examples/03-express-ws/public/index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Express + ws</title>
+  <style>
+    :root { --bg:#f8fafc; --card:#fff; --text:#0f172a; --muted:#64748b; --accent:#4f46e5; --border:#e2e8f0; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width: 980px; margin: 0 auto; padding: 1.5rem 1rem; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1rem; }
+    h2 { margin:.2rem 0 .8rem; font-size:1.05rem; display:flex; justify-content:space-between; }
+    .log { list-style:none; margin:0; padding:0; height: 280px; overflow-y:auto; font-size:14px; }
+    .log li { padding:.2rem 0; border-bottom:1px dashed var(--border); }
+    .muted { color: var(--muted); }
+    .badge { font-size:12px; padding:.1rem .5rem; border-radius:999px; background:#e2e8f0; color:var(--muted); }
+    .badge.on { background:#dcfce7; color:#166534; }
+    form { display:flex; gap:.5rem; margin-top:.6rem; }
+    input { flex:1; padding:.55rem; border:1px solid var(--border); border-radius:8px; }
+    button { padding:.55rem .9rem; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+    button.ghost { background:#e2e8f0; color:var(--text); }
+    .ann { color:#b45309; font-weight:600; }
+    #login { max-width: 420px; margin: 3rem auto; }
+    [hidden] { display:none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <section id="login" class="card">
+    <h2>Log in</h2>
+    <p class="muted">Creates a session cookie. The chat socket authenticates with it.</p>
+    <form id="loginForm"><input id="name" placeholder="Your name" required /><button>Log in</button></form>
+  </section>
+
+  <section id="app" hidden>
+    <p>Logged in as <b id="me"></b> · <button class="ghost" id="logout">Log out</button>
+      · <button class="ghost" id="tryBad">Try /ws/feed with a bad token</button></p>
+    <div class="grid">
+      <div class="card">
+        <h2>/ws/chat <span id="chatState" class="badge">closed</span></h2>
+        <p class="muted" id="online">online: –</p>
+        <ul class="log" id="chatLog"></ul>
+        <form id="chatForm"><input id="chatInput" placeholder="Say something" autocomplete="off" /><button>Send</button></form>
+        <form id="annForm"><input id="annInput" placeholder="Announcement via POST /api/broadcast" /><button class="ghost">POST</button></form>
+      </div>
+      <div class="card">
+        <h2>/ws/feed <span id="feedState" class="badge">closed</span></h2>
+        <p class="muted">JWT from <code>GET /api/token</code>, sent in <code>Sec-WebSocket-Protocol</code>.</p>
+        <ul class="log" id="feedLog"></ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const wsBase = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+  let chat, feed;
+
+  function add(listId, text, cls = '') {
+    const li = document.createElement('li');
+    li.textContent = text; // textContent = no XSS
+    if (cls) li.className = cls;
+    const list = $(listId);
+    list.append(li);
+    if (list.children.length > 200) list.firstChild.remove();
+    list.scrollTop = list.scrollHeight;
+  }
+  function setBadge(id, text, on) { $(id).textContent = text; $(id).classList.toggle('on', on); }
+
+  // 1. Pre-check auth over HTTP: browsers can't see a 401 from a failed WS handshake.
+  async function boot() {
+    const res = await fetch('/api/me');
+    if (!res.ok) { $('login').hidden = false; $('app').hidden = true; return; }
+    const { name } = await res.json();
+    $('me').textContent = name;
+    $('login').hidden = true; $('app').hidden = false;
+    connectChat();
+    connectFeed();
+  }
+
+  // 2. Chat: cookie is sent automatically with the upgrade request.
+  function connectChat() {
+    chat = new WebSocket(`${wsBase}/ws/chat`);
+    chat.onopen = () => setBadge('chatState', 'open', true);
+    chat.onclose = (e) => { setBadge('chatState', `closed ${e.code}`, false); add('chatLog', `closed (${e.code}) ${e.reason}`, 'muted'); };
+    chat.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.kind === 'welcome') add('chatLog', `welcome ${m.you}`, 'muted');
+      if (m.kind === 'presence') $('online').textContent = `online: ${m.online.join(', ')}`;
+      if (m.kind === 'chat') add('chatLog', `${m.from}: ${m.text}`);
+      if (m.kind === 'announcement') add('chatLog', `[announcement] ${m.from}: ${m.text}`, 'ann');
+    };
+  }
+
+  // 3. Feed: fetch a 60-second token, pass it as a subprotocol entry.
+  async function connectFeed(badToken = false) {
+    const res = await fetch('/api/token');
+    if (!res.ok) return add('feedLog', `no token: HTTP ${res.status}`, 'muted');
+    const { token } = await res.json();
+    const t = badToken ? token.slice(0, -3) + 'xxx' : token;
+    const ws = new WebSocket(`${wsBase}/ws/feed`, ['feed.v1', `auth.${t}`]);
+    if (!badToken) feed = ws;
+    ws.onopen = () => { setBadge('feedState', `open (${ws.protocol})`, true); };
+    ws.onerror = () => add('feedLog', 'error event (status code hidden by browser)', 'muted');
+    ws.onclose = (e) => {
+      if (!badToken) setBadge('feedState', `closed ${e.code}`, false);
+      add('feedLog', `${badToken ? 'bad-token socket' : 'feed'} closed: code ${e.code}`, 'muted');
+    };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.kind === 'hello') add('feedLog', `hello ${m.you}, protocol=${m.protocol}`, 'muted');
+      if (m.kind === 'tick') add('feedLog', `${m.time.slice(11, 19)}  chat online: ${m.chatOnline}  rss: ${m.memoryMB} MB`);
+    };
+  }
+
+  $('loginForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const res = await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: $('name').value }),
+    });
+    if (res.ok) boot();
+  };
+
+  $('logout').onclick = async () => {
+    await fetch('/api/logout', { method: 'POST' }); // server closes our chat socket with 4001
+    feed?.close(1000, 'logout');
+    boot();
+  };
+
+  $('chatForm').onsubmit = (e) => {
+    e.preventDefault();
+    if (chat?.readyState === WebSocket.OPEN && $('chatInput').value.trim()) chat.send($('chatInput').value);
+    $('chatInput').value = '';
+  };
+
+  // REST call that results in a WebSocket push to everyone.
+  $('annForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const res = await fetch('/api/broadcast', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: $('annInput').value }),
+    });
+    const body = await res.json();
+    add('chatLog', `POST /api/broadcast → ${res.status} ${JSON.stringify(body)}`, 'muted');
+    $('annInput').value = '';
+  };
+
+  $('tryBad').onclick = () => connectFeed(true);
+
+  boot();
+</script>
+</body>
+</html>
