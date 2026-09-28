@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ch.6 — Secure WebSocket chat</title>
+  <style>
+    body { font: 15px/1.4 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    fieldset { margin-bottom: 1rem; }
+    #log { border: 1px solid #ccc; height: 300px; overflow-y: auto; padding: .5rem; font-family: monospace; white-space: pre-wrap; }
+    .err { color: #b00; } .sys { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Secure chat (ticket auth)</h1>
+
+  <fieldset>
+    <legend>1. Log in (HTTP)</legend>
+    <input id="user" value="bob" /> <input id="pass" type="password" value="bob123" />
+    <button id="connect">Log in &amp; connect</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>2. Rooms &amp; messages (WebSocket)</legend>
+    <select id="room"><option>general</option><option>random</option><option>admins</option></select>
+    <button id="join">Join</button>
+    <input id="text" placeholder="message" /> <button id="send">Send</button>
+    <button id="flood" title="Send 30 messages at once to trip the token bucket">Flood ×30</button>
+    <button id="big" title="Send a 20 KiB frame to exceed maxPayload">Send 20 KiB</button>
+  </fieldset>
+
+  <div id="log"></div>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const log = (line, cls = '') => {
+      const div = document.createElement('div');
+      div.textContent = line;
+      div.className = cls;
+      $('log').append(div);
+      $('log').scrollTop = $('log').scrollHeight;
+    };
+    let ws;
+
+    async function connect() {
+      // Step 1: exchange credentials for a JWT. The JWT stays in memory — it is
+      // used only on HTTP requests (Authorization header), never in a WS URL.
+      const loginRes = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: $('user').value, password: $('pass').value }),
+      });
+      if (!loginRes.ok) return log('login failed', 'err');
+      const { token } = await loginRes.json();
+
+      // Step 2: trade the JWT for a single-use, 30-second ticket.
+      const ticketRes = await fetch('/api/ticket', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!ticketRes.ok) return log('ticket failed', 'err');
+      const { ticket } = await ticketRes.json();
+
+      // Step 3: open the socket with the ticket. Use wss:// when the page is https.
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws?.close();
+      ws = new WebSocket(`${scheme}://${location.host}/ws?ticket=${encodeURIComponent(ticket)}`);
+      ws.onopen = () => log('connected', 'sys');
+      ws.onclose = (e) => log(`closed code=${e.code} reason="${e.reason}"`, 'sys');
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'chat:message') log(`[${msg.payload.room}] ${msg.payload.from}: ${msg.payload.text}`);
+        else if (msg.type === 'error') log(`error: ${msg.payload.reason}`, 'err');
+        else log(`${msg.type} ${JSON.stringify(msg.payload)}`, 'sys');
+      };
+    }
+
+    const send = (type, payload) =>
+      ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type, id: crypto.randomUUID(), payload }));
+
+    $('connect').onclick = connect;
+    $('join').onclick = () => send('room:join', { room: $('room').value });
+    $('send').onclick = () => send('chat:message', { room: $('room').value, text: $('text').value });
+    $('flood').onclick = () => {
+      for (let i = 0; i < 30; i++) send('chat:message', { room: $('room').value, text: `flood ${i}` });
+    };
+    $('big').onclick = () => send('chat:message', { room: $('room').value, text: 'x'.repeat(20 * 1024) });
+  </script>
+</body>
+</html>

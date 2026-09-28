@@ -1,0 +1,55 @@
+# Chapter 8 — Redis + 2 app instances + nginx load balancer.
+#
+#   docker compose -f examples/08-scaling-redis/docker-compose.yml up --build
+#   open http://localhost:8080  (in two tabs — reload until the "node" differs)
+#
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  app1:
+    build:
+      context: ../..
+      dockerfile: examples/08-scaling-redis/Dockerfile
+    environment:
+      PORT: "3000"
+      REDIS_URL: redis://redis:6379
+      NODE_ID: app1
+    depends_on:
+      redis:
+        condition: service_healthy
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    stop_grace_period: 10s
+
+  app2:
+    build:
+      context: ../..
+      dockerfile: examples/08-scaling-redis/Dockerfile
+    environment:
+      PORT: "3000"
+      REDIS_URL: redis://redis:6379
+      NODE_ID: app2
+    depends_on:
+      redis:
+        condition: service_healthy
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    stop_grace_period: 10s
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    depends_on:
+      - app1
+      - app2

@@ -1,0 +1,27 @@
+{
+  "name": "huddle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Huddle — a Slack-lite real-time collaboration app: channels, presence, typing, reactions and mediasoup video huddles. Capstone of the WebSockets mastery course.",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "esbuild public/src/main.js --bundle --format=esm --target=es2022 --sourcemap --outfile=public/bundle.js",
+    "watch": "npm run build -- --watch",
+    "start": "node src/server.js",
+    "dev": "npm run build && node --watch-path=src src/server.js",
+    "test": "node --test --test-concurrency=1 test/"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mediasoup": "^3.15.0",
+    "mediasoup-client": "^3.8.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

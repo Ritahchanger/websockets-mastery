@@ -1,0 +1,30 @@
+{
+  "name": "websockets-mastery",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSockets in Node.js & Express — from beginner to expert, ending with mediasoup (SFU) video.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "ex:01": "node examples/01-raw-handshake/server.js",
+    "ex:02": "node examples/02-echo-ws/server.js",
+    "ex:03": "node examples/03-express-ws/server.js",
+    "ex:04": "node examples/04-chat-rooms/server.js",
+    "ex:05": "node examples/05-reliability/server.js",
+    "ex:06": "node examples/06-security/server.js",
+    "ex:07": "node examples/07-socketio/server.js",
+    "ex:08": "node examples/08-scaling-redis/server.js",
+    "ex:09": "node --test \"examples/09-testing/*.test.js\"",
+    "ex:10": "node examples/10-webrtc-p2p/server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "ioredis": "^5.4.0",
+    "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.0",
+    "@socket.io/redis-adapter": "^8.3.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.0"
+  }
+}

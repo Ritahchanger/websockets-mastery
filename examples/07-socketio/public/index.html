@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ch.7 — Socket.IO chat</title>
+  <style>
+    body { font: 15px/1.4 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    fieldset { margin-bottom: 1rem; }
+    #log { border: 1px solid #ccc; height: 320px; overflow-y: auto; padding: .5rem; background: #fafafa; }
+    #log div { margin: 2px 0; }
+    .sys { color: #777; font-style: italic; }
+    .err { color: #b00; }
+    #status { font-weight: bold; }
+    #typing { height: 1.2em; color: #777; font-size: 13px; }
+    input { padding: 4px 6px; }
+  </style>
+</head>
+<body>
+  <h1>Socket.IO chat (chapter 7)</h1>
+  <p>Status: <span id="status">disconnected</span> · transport: <span id="transport">–</span> · id: <code id="sid">–</code></p>
+
+  <fieldset>
+    <legend>1. Connect (middleware auth)</legend>
+    <input id="name" placeholder="your name" value="" />
+    <button id="connect">Connect</button>
+    <button id="drop" title="Close the underlying transport to test connection state recovery">Simulate network drop</button>
+    <button id="disconnect">Disconnect</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>2. Join a room (ack)</legend>
+    <input id="room" value="general" />
+    <button id="join">Join</button>
+    <button id="ping">Ping server (server→client ack)</button>
+  </fieldset>
+
+  <div id="log"></div>
+  <div id="typing"></div>
+  <form id="form">
+    <input id="text" placeholder="message" autocomplete="off" style="width:70%" />
+    <button>Send</button>
+  </form>
+
+  <script type="module">
+    // The server serves the ESM client build automatically.
+    import { io } from '/socket.io/socket.io.esm.min.js';
+
+    const $ = (id) => document.getElementById(id);
+    const log = (text, cls = '') => {
+      const d = document.createElement('div');
+      d.textContent = text; d.className = cls;
+      $('log').append(d); $('log').scrollTop = $('log').scrollHeight;
+    };
+    $('name').value = 'user-' + Math.floor(Math.random() * 1000);
+
+    let socket = null;
+    let currentRoom = null;
+
+    $('connect').onclick = () => {
+      if (socket) socket.disconnect();
+      socket = io({
+        auth: { name: $('name').value },   // read by io.use() on the server
+        // transports: ['websocket'],       // uncomment to skip long-polling
+      });
+
+      socket.on('connect', () => {
+        $('status').textContent = 'connected';
+        $('sid').textContent = socket.id;
+        $('transport').textContent = socket.io.engine.transport.name;
+        socket.io.engine.once('upgrade', (t) => ($('transport').textContent = t.name));
+        log(socket.recovered
+          ? 'Reconnected — session RECOVERED (rooms + missed messages restored)'
+          : 'Connected (new session)', 'sys');
+        // If the session was NOT recovered, rejoin the room ourselves.
+        if (!socket.recovered && currentRoom) join(currentRoom);
+      });
+
+      socket.on('connect_error', (err) => {
+        log(`connect_error: ${err.message} ${err.data ? JSON.stringify(err.data) : ''}`, 'err');
+        // A middleware rejection is NOT auto-retried: socket.active === false.
+        if (!socket.active) $('status').textContent = 'rejected';
+      });
+
+      socket.on('disconnect', (reason) => {
+        $('status').textContent = socket.active ? 'reconnecting…' : 'disconnected';
+        log(`disconnect: ${reason}`, 'sys');
+      });
+
+      socket.on('chat:message', (m) => log(`[${m.room}] ${m.from}: ${m.text}`));
+      socket.on('room:presence', (p) => log(`${p.name} ${p.event} ${p.room}`, 'sys'));
+      socket.on('system', (p) => log(`SYSTEM: ${p.text}`, 'sys'));
+      socket.on('tick', (t) => console.debug('tick', new Date(t).toISOString()));
+
+      // Server asks us something and awaits our ack
+      socket.on('whattime', (ack) => ack(Date.now()));
+
+      let typingTimer;
+      socket.on('chat:typing', ({ name }) => {
+        $('typing').textContent = `${name} is typing…`;
+        clearTimeout(typingTimer);
+        typingTimer = setTimeout(() => ($('typing').textContent = ''), 1500);
+      });
+    };
+
+    async function join(room) {
+      try {
+        // emitWithAck + timeout: Promise-based request/response
+        const res = await socket.timeout(3000).emitWithAck('room:join', room);
+        if (!res.ok) return log(`join failed: ${res.error}`, 'err');
+        currentRoom = res.room;
+        log(`joined ${res.room}; members: ${res.members.join(', ')}`, 'sys');
+      } catch {
+        log('join timed out', 'err');
+      }
+    }
+
+    $('join').onclick = () => socket && join($('room').value);
+
+    $('ping').onclick = async () => {
+      if (!socket) return;
+      const t0 = performance.now();
+      const res = await socket.emitWithAck('ping:server');
+      log(`ping: ${Math.round(performance.now() - t0)} ms round-trip; ${JSON.stringify(res)}`, 'sys');
+    };
+
+    $('form').onsubmit = async (e) => {
+      e.preventDefault();
+      if (!socket || !currentRoom || !$('text').value) return;
+      const text = $('text').value; $('text').value = '';
+      // If disconnected, Socket.IO BUFFERS this emit and sends it on reconnect.
+      const res = await socket.timeout(5000).emitWithAck('chat:message', { room: currentRoom, text }).catch(() => ({ ok: false, error: 'timeout' }));
+      if (!res.ok) log(`send failed: ${res.error}`, 'err');
+    };
+
+    $('text').oninput = () => socket?.connected && currentRoom && socket.emit('chat:typing', currentRoom);
+
+    // Closing the engine (not calling socket.disconnect()) looks like a network
+    // failure, so the client auto-reconnects and the server can recover state.
+    $('drop').onclick = () => socket?.io.engine.close();
+    $('disconnect').onclick = () => socket?.disconnect();
+  </script>
+</body>
+</html>

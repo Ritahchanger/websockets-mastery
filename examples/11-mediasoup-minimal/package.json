@@ -1,0 +1,22 @@
+{
+  "name": "ex-11-mediasoup-minimal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chapter 11 — minimal mediasoup SFU: one room, everyone publishes cam+mic and consumes everyone else.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build:client": "esbuild public/src/client.js --bundle --format=esm --target=es2020 --sourcemap --outfile=public/bundle.js",
+    "start": "node server.js",
+    "dev": "npm run build:client && npm start"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mediasoup": "^3.14.0",
+    "mediasoup-client": "^3.7.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}

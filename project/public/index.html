@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Huddle</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%237c5cff'/%3E%3Cpath d='M9 11h14M9 16h10M9 21h6' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/bundle.js"></script>
+  </head>
+  <body>
+    <!-- ============ Login ============ -->
+    <section id="login" class="login" hidden>
+      <div class="login-glow"></div>
+      <form id="login-form" class="login-card" autocomplete="off">
+        <div class="brand">
+          <span class="brand-mark">H</span>
+          <span class="brand-name">Huddle</span>
+        </div>
+        <h1>Talk, type, and huddle — in real time.</h1>
+        <p class="muted">Channels, presence, typing indicators, reactions and video huddles over one WebSocket and a mediasoup SFU.</p>
+        <label for="nickname">Pick a nickname</label>
+        <input id="nickname" name="nickname" maxlength="24" placeholder="e.g. ada" required autofocus />
+        <p id="login-error" class="error" role="alert"></p>
+        <button class="btn btn-primary btn-lg" type="submit">Enter workspace</button>
+        <p class="fineprint">No password: this is a demo identity. The server issues a JWT, then a one-time WebSocket ticket.</p>
+      </form>
+    </section>
+
+    <!-- ============ App ============ -->
+    <div id="app" class="app" hidden>
+      <aside class="sidebar">
+        <header class="workspace">
+          <span class="brand-mark sm">H</span>
+          <div>
+            <div class="workspace-name">Huddle</div>
+            <div id="conn" class="conn" data-state="connecting"><span class="dot"></span><span id="conn-label">Connecting…</span></div>
+          </div>
+        </header>
+
+        <nav class="side-section">
+          <div class="side-title">
+            <span>Channels</span>
+            <button id="new-channel" class="icon-btn" title="Create channel" aria-label="Create channel"></button>
+          </div>
+          <ul id="channel-list" class="channel-list"></ul>
+        </nav>
+
+        <div class="side-section grow">
+          <div class="side-title"><span>Online</span><span id="online-count" class="count">0</span></div>
+          <ul id="user-list" class="user-list"></ul>
+        </div>
+
+        <footer class="me">
+          <span id="me-avatar"></span>
+          <div class="me-info">
+            <div id="me-name" class="me-name"></div>
+            <div id="latency" class="muted small">—</div>
+          </div>
+          <button id="logout" class="icon-btn" title="Sign out" aria-label="Sign out"></button>
+        </footer>
+      </aside>
+
+      <main class="main">
+        <header class="channel-header">
+          <div class="channel-title">
+            <span class="hash"></span>
+            <h2 id="channel-name">general</h2>
+            <span id="channel-topic" class="topic"></span>
+          </div>
+          <div class="header-actions">
+            <div id="huddle-faces" class="faces"></div>
+            <button id="huddle-btn" class="btn btn-huddle"><span class="ico"></span><span class="label">Join huddle</span></button>
+          </div>
+        </header>
+
+        <div id="banner" class="banner" hidden>
+          <span id="banner-text"></span>
+          <button id="banner-retry" class="btn btn-ghost btn-sm">Retry now</button>
+        </div>
+
+        <section id="huddle" class="huddle" hidden>
+          <div id="grid" class="grid"></div>
+          <div class="controls">
+            <button id="ctl-mic" class="ctl" title="Mute / unmute (M)"></button>
+            <button id="ctl-cam" class="ctl" title="Camera on / off (V)"></button>
+            <button id="ctl-screen" class="ctl" title="Share screen"></button>
+            <button id="ctl-size" class="ctl" title="Expand"></button>
+            <button id="ctl-leave" class="ctl danger" title="Leave huddle"></button>
+          </div>
+          <div id="audio-sink" hidden></div>
+        </section>
+
+        <section id="messages" class="messages" aria-live="polite"></section>
+
+        <div class="composer-wrap">
+          <div id="typing" class="typing"></div>
+          <form id="composer" class="composer">
+            <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
+            <button id="send" class="send" type="submit" aria-label="Send"></button>
+          </form>
+          <div class="hint muted small"><b>Enter</b> to send · <b>Shift+Enter</b> new line · <code>`code`</code> **bold** _italic_</div>
+        </div>
+      </main>
+    </div>
+
+    <dialog id="channel-dialog" class="dialog">
+      <form method="dialog" id="channel-form">
+        <h3>Create a channel</h3>
+        <label for="channel-name-input">Name</label>
+        <div class="input-prefix"><span>#</span><input id="channel-name-input" placeholder="design-review" maxlength="32" required /></div>
+        <label for="channel-topic-input">Topic <span class="muted">(optional)</span></label>
+        <input id="channel-topic-input" placeholder="What's it about?" maxlength="120" />
+        <p id="channel-error" class="error"></p>
+        <div class="dialog-actions">
+          <button value="cancel" class="btn btn-ghost" formnovalidate>Cancel</button>
+          <button value="ok" class="btn btn-primary">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toasts" class="toasts"></div>
+    <noscript>Huddle needs JavaScript.</noscript>
+  </body>
+</html>

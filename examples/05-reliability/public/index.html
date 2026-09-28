@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ch.5 — Reliability</title>
+  <style>
+    body { font: 14px/1.4 system-ui, sans-serif; max-width: 900px; margin: 1.5rem auto; padding: 0 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .5rem; }
+    .card { border: 1px solid #ccc; border-radius: 6px; padding: .5rem .75rem; }
+    .card b { display: block; font-size: 1.3em; }
+    .state-open { color: #0a7d32; } .state-connecting { color: #b36b00; } .state-closed { color: #b00020; }
+    #log { height: 260px; overflow: auto; background: #111; color: #ddd; padding: .5rem; font: 12px monospace; border-radius: 6px; }
+    #log .replay { color: #7fd1ff; } #log .warn { color: #ffb86b; } #log .chat { color: #9f9; }
+    form, .buttons { display: flex; gap: .5rem; margin: .75rem 0; flex-wrap: wrap; }
+    input { flex: 1; min-width: 0; padding: .4rem; }
+  </style>
+</head>
+<body>
+  <h1>Chapter 5 — Reliability demo</h1>
+  <div class="grid">
+    <div class="card">State <b id="state">–</b></div>
+    <div class="card">Attempt / next delay <b id="backoff">–</b></div>
+    <div class="card">lastSeq <b id="seq">0</b></div>
+    <div class="card">Last tick <b id="tick">–</b></div>
+    <div class="card">Replayed (total) <b id="replayed">0</b></div>
+    <div class="card">Outbox (unacked) <b id="outbox">0</b></div>
+  </div>
+
+  <div class="buttons">
+    <button id="kill">Server: kill all sockets (1006)</button>
+    <button id="drop">Client: drop connection</button>
+    <button id="offline">Client: go offline 8 s</button>
+    <button id="noiseOn">Noise flood ON</button>
+    <button id="noiseOff">Noise OFF</button>
+  </div>
+
+  <form id="chat">
+    <input id="text" placeholder="Type a message — try it while offline!" autocomplete="off" />
+    <button>Send</button>
+  </form>
+  <div id="log"></div>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// ReconnectingSocket: backoff + jitter, watchdog, resume, dedup, outbox.
+// ---------------------------------------------------------------------------
+class ReconnectingSocket extends EventTarget {
+  constructor(url, {
+    baseDelay = 500, maxDelay = 30_000, stableAfter = 5_000, watchdogMs = 40_000,
+  } = {}) {
+    super();
+    Object.assign(this, { url, baseDelay, maxDelay, stableAfter, watchdogMs });
+    this.attempt = 0;
+    this.ws = null;
+    this.stopped = false;
+    this.paused = false;                 // simulated offline mode
+    // Resume state — persisted so even a page reload can resume.
+    this.sessionId = sessionStorage.getItem('sessionId');
+    this.lastSeq = Number(sessionStorage.getItem('lastSeq') ?? 0);
+    this.outbox = new Map();             // id -> envelope, insertion-ordered
+    this.#connect();
+    addEventListener('online', () => this.reconnectNow());
+  }
+
+  // ---- public API ----
+  send(type, payload) {
+    const msg = { type, id: crypto.randomUUID(), payload };
+    this.outbox.set(msg.id, msg);                 // keep until acked
+    if (this.ready) this.ws.send(JSON.stringify(msg));
+    this.#emit('outbox', this.outbox.size);
+    return msg.id;
+  }
+  reconnectNow() { this.attempt = 0; this.ws?.close(4000, 'reconnect now'); }
+  goOffline(ms) {
+    this.paused = true;
+    this.ws?.close(4000, 'simulated offline');
+    setTimeout(() => { this.paused = false; this.reconnectNow(); this.#connect(); }, ms);
+  }
+
+  // ---- internals ----
+  get ready() { return this.ws?.readyState === WebSocket.OPEN && this.sessionReady; }
+
+  #emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
+
+  #connect() {
+    if (this.stopped || this.paused || this.ws) return;
+    this.sessionReady = false;
+    this.#emit('state', 'connecting');
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+
+    ws.onopen = () => {
+      this.#armWatchdog();
+      // First message: resume if we have a session, else hello.
+      const hello = this.sessionId
+        ? { type: 'session:resume', id: crypto.randomUUID(), payload: { sessionId: this.sessionId, lastSeq: this.lastSeq } }
+        : { type: 'session:hello', id: crypto.randomUUID(), payload: {} };
+      ws.send(JSON.stringify(hello));
+      // Only reset backoff once the connection has proven stable.
+      this.stableTimer = setTimeout(() => { this.attempt = 0; this.#emit('backoff', null); }, this.stableAfter);
+    };
+
+    ws.onmessage = (ev) => {
+      this.#armWatchdog();
+      const msg = JSON.parse(ev.data);
+      this.#handle(msg);
+    };
+
+    ws.onclose = (ev) => {
+      clearTimeout(this.watchdog);
+      clearTimeout(this.stableTimer);
+      this.ws = null;
+      this.sessionReady = false;
+      this.#emit('state', `closed (${ev.code}${ev.reason ? ' ' + ev.reason : ''})`);
+      if (ev.code >= 4400 && ev.code < 4500) { this.stopped = true; return; } // fatal: don't retry
+      this.#scheduleReconnect();
+    };
+    ws.onerror = () => { /* 'close' always follows; handle there */ };
+  }
+
+  #scheduleReconnect() {
+    if (this.stopped || this.paused) return;
+    // Full jitter: random(0, min(cap, base * 2^attempt))
+    const ceiling = Math.min(this.maxDelay, this.baseDelay * 2 ** this.attempt);
+    const delay = Math.floor(Math.random() * ceiling);
+    this.attempt++;
+    this.#emit('backoff', { attempt: this.attempt, delay });
+    setTimeout(() => this.#connect(), delay);
+  }
+
+  #armWatchdog() {
+    clearTimeout(this.watchdog);
+    this.watchdog = setTimeout(() => this.ws?.close(4000, 'heartbeat timeout'), this.watchdogMs);
+  }
+
+  #setSession(id, seq) {
+    this.sessionId = id;
+    this.lastSeq = seq;
+    sessionStorage.setItem('sessionId', id);
+    sessionStorage.setItem('lastSeq', String(seq));
+  }
+
+  #onSessionReady() {
+    this.sessionReady = true;
+    this.#emit('state', 'open');
+    // At-least-once: resend everything unacked, in original order.
+    for (const msg of this.outbox.values()) this.ws.send(JSON.stringify(msg));
+  }
+
+  #handle(msg) {
+    switch (msg.type) {
+      case 'session:welcome':
+        this.#setSession(msg.payload.sessionId, msg.payload.seq);
+        this.#onSessionReady();
+        return;
+      case 'session:resumed':
+        this.#emit('resumed', msg.payload.replayed);
+        this.#onSessionReady();
+        return;
+      case 'session:reset':
+        // Server couldn't fill the gap: drop local state, refetch a snapshot in a real app.
+        this.#setSession(msg.payload.sessionId, msg.payload.seq);
+        this.#emit('reset', msg.payload.reason);
+        this.#onSessionReady();
+        return;
+      case 'ack':
+        this.outbox.delete(msg.replyTo);
+        this.#emit('outbox', this.outbox.size);
+        return;
+    }
+    if (typeof msg.seq === 'number') {
+      if (msg.seq <= this.lastSeq) return;              // duplicate from replay: ignore
+      if (msg.seq > this.lastSeq + 1) {                 // gap: should never happen
+        console.warn('gap detected', this.lastSeq, msg.seq);
+        this.ws.close(4000, 'gap');                     // force a resume
+        return;
+      }
+      this.lastSeq = msg.seq;
+      sessionStorage.setItem('lastSeq', String(msg.seq));
+    }
+    this.#emit('message', msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UI wiring
+// ---------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const log = (text, cls = '') => {
+  const div = document.createElement('div');
+  div.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
+  div.className = cls;
+  $('log').prepend(div);
+  while ($('log').childElementCount > 300) $('log').lastChild.remove();
+};
+
+const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+const sock = new ReconnectingSocket(url);
+let replayedTotal = 0;
+let replayRemaining = 0;
+
+sock.addEventListener('state', (e) => {
+  const s = e.detail;
+  $('state').textContent = s;
+  $('state').className = s === 'open' ? 'state-open' : s === 'connecting' ? 'state-connecting' : 'state-closed';
+  log(`state → ${s}`, s === 'open' ? '' : 'warn');
+});
+sock.addEventListener('backoff', (e) => {
+  $('backoff').textContent = e.detail ? `#${e.detail.attempt} / ${e.detail.delay} ms` : 'stable (reset)';
+  if (e.detail) log(`reconnect attempt #${e.detail.attempt} in ${e.detail.delay} ms`, 'warn');
+});
+sock.addEventListener('resumed', (e) => {
+  replayRemaining = e.detail;
+  replayedTotal += e.detail;
+  $('replayed').textContent = replayedTotal;
+  log(`resumed session, server replaying ${e.detail} message(s)`, 'replay');
+});
+sock.addEventListener('reset', (e) => log(`session reset: ${e.detail} (would refetch snapshot)`, 'warn'));
+sock.addEventListener('outbox', (e) => { $('outbox').textContent = e.detail; });
+sock.addEventListener('message', (e) => {
+  const msg = e.detail;
+  $('seq').textContent = sock.lastSeq;
+  const replay = replayRemaining > 0 && msg.seq !== undefined ? (replayRemaining--, true) : false;
+  if (msg.type === 'feed:tick') {
+    $('tick').textContent = msg.payload.n;
+    if (replay) log(`[replay] seq ${msg.seq} tick ${msg.payload.n}`, 'replay');
+  } else if (msg.type === 'chat:message') {
+    log(`${replay ? '[replay] ' : ''}seq ${msg.seq} ${msg.payload.from}: ${msg.payload.text}`, 'chat');
+  } else if (msg.type === 'feed:noise' || msg.type === 'sys:heartbeat') {
+    // ignore
+  } else {
+    log(`${msg.type} ${JSON.stringify(msg.payload)}`);
+  }
+});
+
+$('chat').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = $('text').value.trim();
+  if (!text) return;
+  sock.send('chat:send', { text });
+  $('text').value = '';
+});
+$('kill').onclick = () => fetch('/debug/kill-all', { method: 'POST' });
+$('drop').onclick = () => sock.ws?.close(4000, 'manual drop');
+$('offline').onclick = () => sock.goOffline(8000);
+$('noiseOn').onclick = () => fetch('/debug/noise/on', { method: 'POST' });
+$('noiseOff').onclick = () => fetch('/debug/noise/off', { method: 'POST' });
+</script>
+</body>
+</html>

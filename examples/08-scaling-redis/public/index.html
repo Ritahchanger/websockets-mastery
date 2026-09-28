@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ch.8 — Scaled chat</title>
+  <style>
+    body { font: 15px/1.4 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    #log { border: 1px solid #ccc; height: 320px; overflow-y: auto; padding: .5rem; background: #fafafa; }
+    .via { color: #888; font-size: 12px; }
+    .sys { color: #06c; }
+    form { display: flex; gap: .5rem; margin-top: .5rem; }
+    input[name=text] { flex: 1; }
+    #node { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Scaled chat</h1>
+  <p>Connected to node: <span id="node">…</span></p>
+  <form id="join">
+    <input name="user" placeholder="your name" required value="guest" />
+    <input name="room" placeholder="room" required value="lobby" />
+    <button>Join</button>
+    <button type="button" id="who">Who's here?</button>
+  </form>
+  <div id="log"></div>
+  <form id="chat">
+    <input name="text" placeholder="message" autocomplete="off" />
+    <button>Send</button>
+  </form>
+
+  <script type="module">
+    const $ = (s) => document.querySelector(s);
+    const log = (html, cls = '') => {
+      const div = document.createElement('div');
+      div.className = cls;
+      div.innerHTML = html;
+      $('#log').append(div);
+      $('#log').scrollTop = $('#log').scrollHeight;
+    };
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+    let ws;
+    let room = null;
+    let attempt = 0;
+
+    function connect() {
+      // Same origin: works directly (localhost:3001) or behind nginx (localhost:8080).
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+      ws.onopen = () => {
+        attempt = 0;
+        // After a reconnect (maybe to a DIFFERENT node) re-join our room.
+        if (room) send('room:join', { room, user: $('#join').user.value });
+      };
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        const p = msg.payload;
+        switch (msg.type) {
+          case 'hello': $('#node').textContent = p.node; break;
+          case 'room:joined': log(`joined <b>${esc(p.room)}</b> on ${esc(p.node)}`, 'sys'); break;
+          case 'chat:message':
+            log(`<b>${esc(p.user)}</b>: ${esc(p.text)} <span class="via">via ${esc(p.via)}</span>`);
+            break;
+          case 'presence:joined': log(`${esc(p.user)} joined <span class="via">via ${esc(p.via)}</span>`, 'sys'); break;
+          case 'presence:left': log(`${esc(p.user)} left <span class="via">via ${esc(p.via)}</span>`, 'sys'); break;
+          case 'presence:list':
+            log(`here: ${p.users.map((u) => `${esc(u.user)} (${esc(u.node)})`).join(', ') || 'nobody'}`, 'sys');
+            break;
+          case 'error': log(`error: ${esc(p.message)}`, 'sys'); break;
+        }
+      };
+      ws.onclose = (e) => {
+        // 1001 = server going away (deploy / scale-in). Reconnect with backoff + jitter (chapter 5).
+        const delay = Math.min(10_000, 500 * 2 ** attempt++) * (0.5 + Math.random() / 2);
+        log(`disconnected (${e.code}); reconnecting in ${Math.round(delay)} ms`, 'sys');
+        setTimeout(connect, delay);
+      };
+    }
+
+    function send(type, payload) {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, id: crypto.randomUUID(), payload }));
+    }
+
+    $('#join').onsubmit = (e) => {
+      e.preventDefault();
+      if (room) send('room:leave', { room });
+      room = e.target.room.value;
+      send('room:join', { room, user: e.target.user.value });
+    };
+    $('#who').onclick = () => room && send('presence:list', { room });
+    $('#chat').onsubmit = (e) => {
+      e.preventDefault();
+      const text = e.target.text.value.trim();
+      if (text && room) send('chat:message', { room, text });
+      e.target.text.value = '';
+    };
+
+    connect();
+  </script>
+</body>
+</html>
