@@ -347,7 +347,7 @@ sequenceDiagram
 
   A->>S: getRouterRtpCapabilities
   S-->>A: { rtpCapabilities } (router.rtpCapabilities)
-  A->>A: device = Device.factory(); device.load({routerRtpCapabilities})
+  A->>A: device = Device.factory(), then device.load({routerRtpCapabilities})
 
   A->>S: createWebRtcTransport {direction:'send', sctpCapabilities}
   S->>W: router.createWebRtcTransport(listenInfos…)
@@ -374,7 +374,7 @@ sequenceDiagram
   W-->>A: SRTP: Bob's video/audio 🎥
 
   Note over A,W: publish Alice's camera + mic
-  A->>A: getUserMedia(); sendTransport.produce({track, encodings})
+  A->>A: getUserMedia(), then sendTransport.produce({track, encodings})
   A->>S: connectTransport {transportId: send, dtlsParameters} ('connect' event)
   S-->>A: {} → callback()
   A->>S: produce {transportId: send, kind:'video', rtpParameters, appData}

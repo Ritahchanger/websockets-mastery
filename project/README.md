@@ -42,7 +42,7 @@
 ```mermaid
 flowchart LR
   subgraph Browser
-    UI[main.js UI] --> HS[HuddleSocket<br/>backoff · request() · resync]
+    UI[main.js UI] --> HS["HuddleSocket<br/>backoff · request() · resync"]
     UI --> HM[HuddleMedia<br/>mediasoup-client Device]
     HM -- signaling --> HS
   end
