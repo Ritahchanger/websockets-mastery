@@ -63,6 +63,10 @@ project/     Huddle: capstone app (chat + mediasoup video), own package.json
 
 ## Capstone: Huddle
 
+![Huddle: two users in a #general video huddle with live chat, reactions and presence](public/castone-project.png)
+
+*Two browser windows (peterdennis and kelvin) in the same `#general` huddle: video tiles via the mediasoup SFU, live chat with reactions, and presence in the sidebar.*
+
 ```bash
 cd project && npm install && npm run dev   # → http://localhost:3000
 ```
